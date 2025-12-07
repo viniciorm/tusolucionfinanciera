@@ -200,16 +200,9 @@
                     Solicita tu revisión personalizada
                 </h2>
                 
-                <form action="https://api.web3forms.com/submit" method="POST" id="contactForm" class="space-y-6">
+                <form id="contactForm" class="space-y-6">
                     <!-- Web3Forms Access Key -->
                     <input type="hidden" name="access_key" value="8b570fa8-b326-4965-8648-75715212ee50">
-                    
-                    <!-- Google Sheets Webhook -->
-                    <input 
-                        type="hidden" 
-                        name="webhook" 
-                        value="https://script.google.com/macros/s/AKfycbzIF3PxQ_3v8v0jy0JDIscABDIgne8S_OyW4hxhc5dAnqcQOAUjoiXogQ6FM6Z44gZeUg/exec"
-                    >
                     
                     <!-- Honeypot anti-spam -->
                     <input type="text" name="website" style="display:none" tabindex="-1" autocomplete="off">
