@@ -6,6 +6,9 @@
     <title>Tu Solución Financiera - Estrategia financiera para maximizar beneficio tributario 2025</title>
     <meta name="description" content="Aprovecha el beneficio estatal del APV (hasta 600 UF) y optimiza tu base tributable. Revisamos tu caso sin costo.">
     
+    <!-- Favicon -->
+    <link rel="icon" type="image/png" href="assets/favicon.png">
+    
     <!-- TailwindCSS CDN -->
     <script src="https://cdn.tailwindcss.com"></script>
     
@@ -35,23 +38,47 @@
 </head>
 <body class="bg-white">
     
+    <!-- HEADER -->
+    <header class="w-full shadow-md py-5 md:py-6 sticky top-0 z-50" style="background-color: #003A8C;">
+        <div class="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 flex items-center justify-center">
+            <img src="assets/logo.png" alt="Tu Solución Financiera" class="h-20 md:h-24 object-contain">
+        </div>
+    </header>
+    
     <!-- 1. HERO SECTION -->
     <section id="hero" class="min-h-screen flex items-center justify-center px-4 sm:px-6 lg:px-8" style="background-color: #003A8C;">
-        <div class="max-w-4xl mx-auto text-center text-white">
-            <h1 class="text-4xl sm:text-5xl md:text-6xl font-bold mb-6 leading-tight">
-                Estrategia financiera para maximizar beneficio tributario 2025.
-            </h1>
-            <p class="text-xl sm:text-2xl md:text-3xl mb-10 font-normal opacity-90 max-w-3xl mx-auto">
-                Aprovecha el beneficio estatal del APV (hasta 600 UF) sobre tu base tributable.
-            </p>    <p class="text-xl sm:text-2xl md:text-3xl mb-10 font-normal opacity-90 max-w-3xl mx-auto">
-                ¡Solo hasta el 26 de diciembre!
-            </p>
-            <button 
-                onclick="document.getElementById('formulario').scrollIntoView({ behavior: 'smooth' })"
-                class="bg-[#D4A857] hover:bg-[#B38A3C] text-white font-semibold py-4 px-8 rounded-lg text-lg transition-all duration-300 transform hover:scale-105 shadow-lg"
-            >
-                Solicita tu asesoría personalizada
-            </button>
+        <div class="max-w-6xl mx-auto">
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-8 lg:gap-12 items-center">
+                <!-- Columna izquierda: Textos -->
+                <div class="text-center lg:text-left text-white">
+                    <h1 class="text-4xl sm:text-5xl md:text-6xl font-bold mb-6 leading-tight">
+                        Estrategia financiera para maximizar beneficio tributario 2025.
+                    </h1>
+                    <p class="text-xl sm:text-2xl md:text-3xl mb-4 font-normal opacity-90">
+                        Aprovecha el beneficio estatal del APV (hasta 600 UF) sobre tu base tributable.
+                    </p>
+                    <p class="text-xl sm:text-2xl md:text-3xl mb-10 font-normal opacity-90">
+                        ¡Solo hasta el 26 de diciembre!
+                    </p>
+                    <div class="flex justify-center lg:justify-start">
+                        <button 
+                            onclick="document.getElementById('formulario').scrollIntoView({ behavior: 'smooth' })"
+                            class="bg-[#D4A857] hover:bg-[#B38A3C] text-white font-semibold py-4 px-8 rounded-lg text-lg transition-all duration-300 transform hover:scale-105 shadow-lg"
+                        >
+                            Solicita tu asesoría personalizada
+                        </button>
+                    </div>
+                </div>
+                <!-- Columna derecha: Imagen ejecutiva -->
+                <div class="flex justify-center lg:justify-end order-first lg:order-last">
+                    <img 
+                        src="assets/ejecutiva.png" 
+                        alt="Asesoría financiera" 
+                        class="w-full max-w-[500px] lg:max-w-[600px] rounded-xl shadow-md object-cover"
+                        style="height: 500px; width: 100%;"
+                    >
+                </div>
+            </div>
         </div>
     </section>
 
@@ -173,8 +200,18 @@
                     Solicita tu revisión personalizada
                 </h2>
                 
-                <form id="contactForm" class="space-y-6">
-                    <!-- Honeypot field (invisible) -->
+                <form action="https://api.web3forms.com/submit" method="POST" id="contactForm" class="space-y-6">
+                    <!-- Web3Forms Access Key -->
+                    <input type="hidden" name="access_key" value="8b570fa8-b326-4965-8648-75715212ee50">
+                    
+                    <!-- Google Sheets Webhook -->
+                    <input 
+                        type="hidden" 
+                        name="webhook" 
+                        value="https://script.google.com/macros/s/AKfycbzIF3PxQ_3v8v0jy0JDIscABDIgne8S_OyW4hxhc5dAnqcQOAUjoiXogQ6FM6Z44gZeUg/exec"
+                    >
+                    
+                    <!-- Honeypot anti-spam -->
                     <input type="text" name="website" style="display:none" tabindex="-1" autocomplete="off">
                     
                     <!-- Nombre -->
@@ -184,6 +221,7 @@
                             type="text" 
                             id="nombre" 
                             name="nombre" 
+                            placeholder="Nombre completo"
                             required
                             class="w-full px-4 py-3 border-2 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#D4A857] transition-all"
                             style="border-color: #003A8C;"
@@ -198,6 +236,7 @@
                             type="email" 
                             id="email" 
                             name="email" 
+                            placeholder="Correo electrónico"
                             required
                             class="w-full px-4 py-3 border-2 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#D4A857] transition-all"
                             style="border-color: #003A8C;"
@@ -208,36 +247,32 @@
                     <!-- Teléfono -->
                     <div>
                         <label for="telefono" class="block text-sm font-semibold mb-2" style="color: #003A8C;">Teléfono *</label>
-                        <div class="flex">
-                            <span class="inline-flex items-center px-4 py-3 border-2 rounded-l-lg bg-gray-50" style="border-color: #003A8C;">+569</span>
-                            <input 
-                                type="tel" 
-                                id="telefono" 
-                                name="telefono" 
-                                required
-                                maxlength="8"
-                                pattern="[0-9]{8}"
-                                placeholder="12345678"
-                                class="w-full px-4 py-3 border-2 border-l-0 rounded-r-lg focus:outline-none focus:ring-2 focus:ring-[#D4A857] transition-all"
-                                style="border-color: #003A8C;"
-                            >
-                        </div>
+                        <input 
+                            type="text" 
+                            id="telefono" 
+                            name="telefono" 
+                            placeholder="+569 12345678"
+                            pattern="^(\+569)(\d{8})$"
+                            required
+                            class="w-full px-4 py-3 border-2 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#D4A857] transition-all"
+                            style="border-color: #003A8C;"
+                        >
                         <span class="error-message text-red-600 text-sm hidden"></span>
                     </div>
                     
-                    <!-- APV Actualmente -->
+                    <!-- Tiene APV -->
                     <div>
-                        <label for="apv-actual" class="block text-sm font-semibold mb-2" style="color: #003A8C;">¿Tienes APV actualmente? *</label>
+                        <label for="tiene_apv" class="block text-sm font-semibold mb-2" style="color: #003A8C;">¿Tienes APV actualmente? *</label>
                         <select 
-                            id="apv-actual" 
-                            name="apv-actual" 
+                            id="tiene_apv" 
+                            name="tiene_apv" 
                             required
                             class="w-full px-4 py-3 border-2 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#D4A857] transition-all bg-white"
                             style="border-color: #003A8C;"
                         >
-                            <option value="">Selecciona una opción</option>
-                            <option value="si">Sí</option>
-                            <option value="no">No</option>
+                            <option value="">¿Tienes APV actualmente?</option>
+                            <option value="Sí">Sí</option>
+                            <option value="No">No</option>
                         </select>
                         <span class="error-message text-red-600 text-sm hidden"></span>
                     </div>
@@ -252,24 +287,22 @@
                             class="w-full px-4 py-3 border-2 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#D4A857] transition-all bg-white"
                             style="border-color: #003A8C;"
                         >
-                            <option value="">Selecciona una opción</option>
-                            <option value="si">Sí</option>
-                            <option value="no">No</option>
+                            <option value="">¿Deseas optimizar tu base tributable?</option>
+                            <option value="Sí">Sí</option>
+                            <option value="No">No</option>
                         </select>
                         <span class="error-message text-red-600 text-sm hidden"></span>
                     </div>
                     
-                    <!-- Mensaje de éxito (oculto inicialmente) -->
-                    <div id="successMessage" class="hidden p-4 rounded-lg text-white font-semibold text-center" style="background-color: #10b981;">
-                        Gracias por tu solicitud. Te contactaremos en las próximas horas.
-                    </div>
+                    <!-- Mensaje de resultado -->
+                    <p id="result" class="text-green-600 font-semibold text-center"></p>
                     
                     <!-- Botón enviar -->
                     <button 
                         type="submit"
                         class="w-full bg-[#D4A857] hover:bg-[#B38A3C] text-white font-semibold py-4 px-8 rounded-lg text-lg transition-all duration-300 transform hover:scale-105 shadow-lg"
                     >
-                        Enviar solicitud
+                        Solicitar revisión
                     </button>
                 </form>
             </div>
@@ -278,21 +311,17 @@
 
     <!-- 6. FOOTER -->
     <footer class="py-12 px-4 sm:px-6 lg:px-8" style="background-color: #003A8C;">
-        <div class="max-w-6xl mx-auto">
-            <div class="flex flex-col md:flex-row justify-between items-center space-y-4 md:space-y-0">
-                <div class="text-white">
-                    <p class="font-semibold mb-2">Contacto</p>
-                    <a href="mailto:contacto@tusolucionfinanciera.cl" class="text-white hover:text-[#D4A857] transition-colors">
-                        contacto@tusolucionfinanciera.cl
-                    </a>
-                </div>
-                <div class="flex flex-col md:flex-row space-y-2 md:space-y-0 md:space-x-6 text-white">
-                    <a href="#" class="hover:text-[#D4A857] transition-colors">Política de privacidad</a>
-                    <a href="#" class="hover:text-[#D4A857] transition-colors">Términos y condiciones</a>
-                </div>
-            </div>
-            <div class="mt-8 pt-8 border-t border-white border-opacity-20 text-center text-white text-sm">
-                <p>&copy; 2024 Tu Solución Financiera. Todos los derechos reservados.</p>
+        <div class="max-w-6xl mx-auto text-center text-white">
+            <p class="mb-4">&copy; 2025 Tu Solución Financiera. Todos los derechos reservados.</p>
+            <p class="mb-4">
+                <a href="mailto:contacto@tusolucionfinanciera.cl" class="text-white hover:text-[#D4A857] transition-colors">
+                    contacto@tusolucionfinanciera.cl
+                </a>
+            </p>
+            <div class="flex flex-col sm:flex-row justify-center items-center space-y-2 sm:space-y-0 sm:space-x-4">
+                <a href="politica-privacidad.html" class="text-white hover:text-[#D4A857] transition-colors">Política de Privacidad</a>
+                <span class="hidden sm:inline">|</span>
+                <a href="terminos.html" class="text-white hover:text-[#D4A857] transition-colors">Términos y Condiciones</a>
             </div>
         </div>
     </footer>
