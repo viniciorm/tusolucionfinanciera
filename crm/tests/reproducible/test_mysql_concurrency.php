@@ -7,27 +7,57 @@
  * 1. Exige una base de datos de prueba configurada explícitamente (ej. `tusoluc1_crm_test`).
  *    Por motivos de seguridad, NUNCA utiliza DB_DATABASE como alternativa ni permite
  *    ejecutarse sobre bases principales.
- * 2. Comprueba mediante dos procesos del sistema operativo que el segundo proceso esperó
- *    efectivamente en `LOCK WAIT` mientras el primer proceso retuvo el bloqueo pesimista.
- * 3. Ejecuta y comprueba el servicio real de reconciliación (`AdvisorAssignmentResolver::reconcilePendingLeads`),
- *    verificando que preserva la asignación manual previa sin sobrescribirla.
- * 4. Diseñada para ejecución segura en hosting compartido (cPanel / Cron / CLI) sin
- *    exponer contraseñas ni credenciales en la línea de comandos ni en los registros.
+ * 2. Comprueba que el Proceso B intenta adquirir el bloqueo ANTES del commit de A,
+ *    y mide estrictamente la espera de esa operación de base de datos (excluyendo el
+ *    arranque o inicialización de Laravel).
+ * 3. Ejecuta el servicio real de Laravel (`AdvisorAssignmentResolver::reconcilePendingLeads`).
+ *    Si el servicio real no está disponible, reporta que la prueba no se ejecutó;
+ *    NUNCA se presenta como aprobada mediante un fallback PDO.
+ * 4. Verifica el resultado del servicio (`skipped_manual = 1`) y la auditoría registrada
+ *    en `audit_events` (`leads.reconciliation_preserved_manual`).
+ * 5. Diseñada para ejecución segura en hosting compartido (cPanel / Cron / CLI) sin
+ *    exponer contraseñas ni credenciales en la línea de comandos ni en los registros,
+ *    con mecanismo de bloqueo para impedir ejecuciones repetidas cada minuto de Cron.
  *
- * Modo de uso seguro:
- * - Crear archivo privado /home/tusoluc1/test_crm.env con permisos 600:
- *     MYSQL_TEST_HOST=localhost
- *     MYSQL_TEST_PORT=3306
- *     MYSQL_TEST_DATABASE=tusoluc1_crm_test
- *     MYSQL_TEST_USERNAME=tusoluc1_crmusr_test
- *     MYSQL_TEST_PASSWORD="password_de_prueba"
- *
- * - Ejecutar:
- *     php crm/tests/reproducible/test_mysql_concurrency.php
+ * Configuración en hosting:
+ * - Base de datos de prueba: tusoluc1_crm_test
+ * - Usuario exclusivo: tusoluc1_crmtest
+ * - PHP CLI comprobado: /usr/local/bin/php
  */
 
-// Cargar credenciales desde archivo seguro si existe (.env específico de prueba)
+// 1. Detección y prevención de ejecuciones repetitivas en Cron (One-shot run lock)
+$options = getopt('', ['worker', 'lead::', 'mgmt::', 'env-file::', 'force']);
+$isWorker = isset($options['worker']);
+
+$possibleFlagFiles = [
+    getenv('CONCURRENCY_FLAG_FILE'),
+    '/home/tusoluc1/concurrency_test_executed.flag',
+    sys_get_temp_dir() . '/concurrency_test_executed.flag',
+];
+
+$flagFile = null;
+foreach ($possibleFlagFiles as $candidate) {
+    if (!empty($candidate)) {
+        $flagFile = $candidate;
+        break;
+    }
+}
+
+if (!$isWorker && file_exists($flagFile) && !isset($options['force'])) {
+    $executedAt = trim(@file_get_contents($flagFile) ?: 'anteriormente');
+    echo "======================================================================\n";
+    echo "AVISO: La prueba ya fue ejecutada previamente ({$executedAt}).\n";
+    echo "Para impedir ejecuciones repetidas cada minuto de Cron, la tarea se detiene.\n";
+    echo "Para volver a ejecutarla, elimine el archivo:\n";
+    echo "  {$flagFile}\n";
+    echo "o invoque el script agregando el parámetro --force.\n";
+    echo "======================================================================\n";
+    exit(0);
+}
+
+// 2. Cargar credenciales desde archivo seguro si existe (.env específico de prueba)
 $possibleEnvFiles = [
+    $options['env-file'] ?? null,
     getenv('TEST_ENV_FILE'),
     '/home/tusoluc1/test_crm.env',
     dirname(__DIR__, 2) . '/test_crm.env',
@@ -55,25 +85,6 @@ foreach ($possibleEnvFiles as $envFile) {
         break;
     }
 }
-
-// Parsear argumentos CLI (usados internamente para sincronización entre procesos)
-$options = getopt('', ['worker', 'lead::', 'mgmt::', 'env-file::']);
-
-if (isset($options['env-file']) && file_exists($options['env-file'])) {
-    $lines = file($options['env-file'], FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-    foreach ($lines as $line) {
-        $line = trim($line);
-        if (!empty($line) && !str_starts_with($line, '#') && str_contains($line, '=')) {
-            [$k, $v] = explode('=', $line, 2);
-            $k = trim($k);
-            $v = trim($v, " \t\n\r\0\x0B\"'");
-            putenv("{$k}={$v}");
-            $_ENV[$k] = $v;
-        }
-    }
-}
-
-$isWorker = isset($options['worker']);
 
 // REGLA ESTRICTA DE SEGURIDAD:
 // Exigir MYSQL_TEST_DATABASE explícito. NUNCA usar DB_DATABASE como alternativa.
@@ -137,7 +148,9 @@ function ensureTestTables(PDO $pdo): void {
             target_id VARCHAR(100) NULL,
             payload JSON NULL,
             created_at TIMESTAMP NULL,
-            updated_at TIMESTAMP NULL
+            updated_at TIMESTAMP NULL,
+            INDEX idx_target (target_id),
+            INDEX idx_action (action)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
         CREATE TABLE IF NOT EXISTS activities (
@@ -164,117 +177,100 @@ if ($isWorker) {
         exit(1);
     }
 
-    // Señal de preparación enviada al Proceso A
-    echo "WORKER_READY\n";
-    if (ob_get_level() > 0) {
-        ob_flush();
-    }
-    flush();
-
-    $startTime = microtime(true);
-
-    // Estrategia 1: Probar el servicio real de Laravel si está disponible en el entorno
     $autoloadPath = dirname(__DIR__, 2) . '/vendor/autoload.php';
     $bootstrapPath = dirname(__DIR__, 2) . '/bootstrap/app.php';
 
-    if (file_exists($autoloadPath) && file_exists($bootstrapPath)) {
-        try {
-            require_once $autoloadPath;
-            $app = require $bootstrapPath;
-            $kernel = $app->make(\Illuminate\Contracts\Console\Kernel::class);
-            $kernel->bootstrap();
-
-            // Configurar dinámicamente la conexión a la base de pruebas aislada
-            config([
-                'database.default' => 'mysql_concurrency_test',
-                'database.connections.mysql_concurrency_test' => [
-                    'driver' => 'mysql',
-                    'host' => $host,
-                    'port' => (int) $port,
-                    'database' => $database,
-                    'username' => $username,
-                    'password' => $password,
-                    'charset' => 'utf8mb4',
-                    'collation' => 'utf8mb4_unicode_ci',
-                    'prefix' => '',
-                    'strict' => true,
-                    'engine' => 'InnoDB',
-                ],
-            ]);
-            \Illuminate\Support\Facades\DB::purge('mysql_concurrency_test');
-            \Illuminate\Support\Facades\DB::setDefaultConnection('mysql_concurrency_test');
-
-            // Iniciar reconciliación con el servicio REAL
-            // Esta llamada se detendrá en `lockForUpdate()` en MySQL InnoDB mientras Proceso A retenga el cerrojo
-            $resolverResult = \App\Services\AdvisorAssignmentResolver::reconcilePendingLeads(limit: 10);
-            $elapsedWait = microtime(true) - $startTime;
-
-            $leadModel = \App\Models\Lead::find($leadId);
-            $mgmtModel = \App\Models\LeadManagement::where('lead_id', $leadId)->first();
-
-            echo json_encode([
-                'success' => true,
-                'tested_mode' => 'real_laravel_service',
-                'service' => 'AdvisorAssignmentResolver::reconcilePendingLeads',
-                'waited_seconds' => round($elapsedWait, 4),
-                'assigned_user_id' => $mgmtModel ? (int) $mgmtModel->assigned_user_id : null,
-                'reconciliation_pending' => $leadModel ? (int) $leadModel->reconciliation_pending : null,
-                'resolver_result' => $resolverResult,
-                'message' => 'Servicio real ejecutado; bloqueo de InnoDB respetado y asignación manual preservada',
-            ]);
-            exit(0);
-        } catch (\Throwable $e) {
-            // Si falla el arranque de Laravel, reportar error de servicio
-            echo json_encode([
-                'success' => false,
-                'waited_seconds' => round(microtime(true) - $startTime, 4),
-                'message' => 'Excepción en servicio real de Laravel: ' . $e->getMessage(),
-            ]);
-            exit(1);
-        }
+    // REGLA ESTRICTA: Exigir el servicio real de Laravel.
+    // Si no está disponible, reportar que la prueba NO se ejecutó; NO aprobar mediante fallback.
+    if (!file_exists($autoloadPath) || !file_exists($bootstrapPath)) {
+        echo json_encode([
+            'success' => false,
+            'error_type' => 'SERVICE_UNAVAILABLE',
+            'message' => 'PRUEBA NO EJECUTADA: El framework Laravel o dependencias de vendor/ no están disponibles en este entorno. No se aprueba mediante fallback simulado.',
+        ]);
+        exit(1);
     }
 
-    // Estrategia 2: Fallback puro PDO (simula exactamente las consultas del servicio)
     try {
-        $dsn = "mysql:host={$host};port={$port};dbname={$database};charset=utf8mb4";
-        $pdo = new PDO($dsn, $username, $password, [
-            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-            PDO::ATTR_TIMEOUT => 15,
-        ]);
+        // 1. Inicializar Laravel ANTES de medir la espera del bloqueo
+        require_once $autoloadPath;
+        $app = require $bootstrapPath;
+        $kernel = $app->make(\Illuminate\Contracts\Console\Kernel::class);
+        $kernel->bootstrap();
 
-        $pdo->beginTransaction();
-        $stmt = $pdo->prepare("SELECT id, assigned_user_id FROM lead_management WHERE id = :id FOR UPDATE");
-        $stmt->execute(['id' => $mgmtId]);
-        $row = $stmt->fetch();
-        $elapsedWait = microtime(true) - $startTime;
-
-        if ($row && $row['assigned_user_id'] !== null) {
-            $pdo->prepare("UPDATE leads SET reconciliation_pending = 0, updated_at = NOW() WHERE id = :lead_id")
-                ->execute(['lead_id' => $leadId]);
-            $pdo->commit();
-
-            echo json_encode([
-                'success' => true,
-                'tested_mode' => 'pdo_fallback',
-                'waited_seconds' => round($elapsedWait, 4),
-                'assigned_user_id' => (int) $row['assigned_user_id'],
-                'message' => 'Bloqueo respetado y asignación manual preservada (PDO)',
-            ]);
-            exit(0);
-        } else {
-            $pdo->rollBack();
+        if (!class_exists(\App\Services\AdvisorAssignmentResolver::class)) {
             echo json_encode([
                 'success' => false,
-                'waited_seconds' => round($elapsedWait, 4),
-                'message' => 'assigned_user_id permaneció nulo tras espera',
+                'error_type' => 'SERVICE_UNAVAILABLE',
+                'message' => 'PRUEBA NO EJECUTADA: La clase AdvisorAssignmentResolver no existe en el código cargado.',
             ]);
             exit(1);
         }
+
+        // Configurar dinámicamente la conexión a la base de pruebas aislada
+        config([
+            'database.default' => 'mysql_concurrency_test',
+            'database.connections.mysql_concurrency_test' => [
+                'driver' => 'mysql',
+                'host' => $host,
+                'port' => (int) $port,
+                'database' => $database,
+                'username' => $username,
+                'password' => $password,
+                'charset' => 'utf8mb4',
+                'collation' => 'utf8mb4_unicode_ci',
+                'prefix' => '',
+                'strict' => true,
+                'engine' => 'InnoDB',
+            ],
+        ]);
+        \Illuminate\Support\Facades\DB::purge('mysql_concurrency_test');
+        \Illuminate\Support\Facades\DB::setDefaultConnection('mysql_concurrency_test');
+
+        // 2. SINCRONIZACIÓN: Laravel ya arrancó y la conexión está lista.
+        // Se envía la señal a Proceso A indicando que Proceso B está por ingresar al bloqueo.
+        echo "SERVICE_READY_FOR_LOCK\n";
+        if (ob_get_level() > 0) {
+            ob_flush();
+        }
+        flush();
+
+        // 3. MEDICIÓN ESTRICTA DE LA ESPERA DEL BLOQUEO:
+        // Se toma el tiempo inmediatamente antes de invocar reconcilePendingLeads()
+        // (excluyendo por completo el tiempo de arranque de Laravel).
+        $startLockWait = microtime(true);
+
+        // Esta llamada ejecuta DB::transaction() y entra en lockForUpdate(),
+        // quedando físicamente retenida en LOCK WAIT en InnoDB hasta que Proceso A hace COMMIT.
+        $resolverResult = \App\Services\AdvisorAssignmentResolver::reconcilePendingLeads(limit: 10);
+        $lockWaitDuration = microtime(true) - $startLockWait;
+
+        // 4. Verificación exhaustiva post-desbloqueo
+        $finalLead = \App\Models\Lead::find($leadId);
+        $finalMgmt = \App\Models\LeadManagement::where('lead_id', $leadId)->first();
+
+        // Comprobar auditoría registrada
+        $auditEvent = \App\Models\AuditEvent::where('action', 'leads.reconciliation_preserved_manual')
+            ->where('target_id', (string)$leadId)
+            ->first();
+
+        echo json_encode([
+            'success' => true,
+            'service_executed' => 'AdvisorAssignmentResolver::reconcilePendingLeads',
+            'lock_wait_seconds' => round($lockWaitDuration, 4),
+            'resolver_result' => $resolverResult,
+            'audit_logged' => $auditEvent !== null,
+            'audit_payload' => $auditEvent ? $auditEvent->payload : null,
+            'assigned_user_id' => $finalMgmt ? (int)$finalMgmt->assigned_user_id : null,
+            'reconciliation_pending' => $finalLead ? (int)$finalLead->reconciliation_pending : null,
+            'message' => 'Servicio real ejecutado; bloqueo de InnoDB respetado y asignación manual preservada',
+        ]);
+        exit(0);
     } catch (\Throwable $e) {
         echo json_encode([
             'success' => false,
-            'message' => 'Excepción en PDO Worker B: ' . $e->getMessage(),
+            'error_type' => 'EXECUTION_EXCEPTION',
+            'message' => 'Excepción en servicio real de Laravel: ' . $e->getMessage(),
         ]);
         exit(1);
     }
@@ -321,7 +317,8 @@ if (!str_contains(strtolower($database), 'test')) {
 echo "Destino: {$host}:{$port}\n";
 echo "Base de datos de prueba: {$database} [AISLADA / TEST]\n";
 echo "Usuario de prueba: " . ($username ?: '(no definido)') . "\n";
-echo "Credenciales: [PROTEGIDAS / SIN EXPOSICIÓN EN LÍNEA DE COMANDOS]\n\n";
+echo "PHP CLI comprobado: " . PHP_BINARY . "\n";
+echo "Credenciales: [PROTEGIDAS / CARGADAS DESDE ARCHIVO SEGURO]\n\n";
 
 if (empty($username)) {
     echo "----------------------------------------------------------------------\n";
@@ -340,7 +337,7 @@ try {
     ]);
 } catch (PDOException $e) {
     echo "----------------------------------------------------------------------\n";
-    echo "[PRUEBA OMITIDA - NO APROBADA]\n";
+    echo "[PRUEBA PENDIENTE / OMITIDA - NO APROBADA]\n";
     echo "Motivo: No se pudo conectar a la base de pruebas ({$e->getMessage()}).\n";
     echo "Compruebe que el servicio MySQL esté activo y el usuario tenga privilegios en '{$database}'.\n";
     echo "----------------------------------------------------------------------\n";
@@ -351,11 +348,11 @@ try {
 ensureTestTables($pdoA);
 
 // 1. Preparar registro de prueba con reconciliation_pending = 1 y assigned_user_id = NULL
-$metaId = 'crm-concurrence-' . bin2hex(random_bytes(6));
+$metaId = 'crm-sync-race-' . bin2hex(random_bytes(6));
 $sourceKey = sha1('Hoja3_' . $metaId);
 
 echo "[1/6] Creando lead de prueba en base aislada (meta_id: {$metaId})...\n";
-$stmtLead = $pdoA->prepare("INSERT INTO leads (source_key, source_sheet, meta_id, name, email, source_assigned_to, reconciliation_pending, original, created_at, updated_at) VALUES (:key, 'Hoja 3', :meta, 'Lead Concurrente', 'test@concurrente.cl', 'Pao', 1, '{}', NOW(), NOW())");
+$stmtLead = $pdoA->prepare("INSERT INTO leads (source_key, source_sheet, meta_id, name, email, source_assigned_to, reconciliation_pending, original, created_at, updated_at) VALUES (:key, 'Hoja 3', :meta, 'Lead Concurrente Test', 'test@concurrente.cl', 'Pao', 1, '{}', NOW(), NOW())");
 $stmtLead->execute(['key' => $sourceKey, 'meta' => $metaId]);
 $leadId = (int) $pdoA->lastInsertId();
 
@@ -370,11 +367,11 @@ try {
     $stmtLock = $pdoA->prepare("SELECT id, assigned_user_id FROM lead_management WHERE id = :id FOR UPDATE");
     $stmtLock->execute(['id' => $mgmtId]);
     $lockedRow = $stmtLock->fetch();
-    echo "      -> Bloqueo exclusivo retenido por Proceso A.\n";
+    echo "      -> Bloqueo exclusivo de fila retenido exitosamente por Proceso A.\n";
 
     // 3. Lanzar Proceso B como subproceso independiente
     // Las credenciales se transmiten mediante variables de entorno seguras de proc_open, NUNCA en argv
-    echo "[3/6] Iniciando Proceso B concurrente en segundo plano (probando reconciliación)...\n";
+    echo "[3/6] Iniciando Proceso B concurrente (inicializando Laravel y servicio real)...\n";
     $descriptors = [
         0 => ['pipe', 'r'],
         1 => ['pipe', 'w'],
@@ -398,19 +395,29 @@ try {
         throw new RuntimeException("No fue posible iniciar el subproceso B.");
     }
 
-    // Esperar señal de que Proceso B ya está conectado e invocando la reconciliación
+    // SINCRONIZACIÓN EXACTA:
+    // Esperar señal de que Proceso B ya inicializó Laravel por completo y está entrando a la consulta de bloqueo
     $signal = trim(fgets($pipes[1]));
-    if ($signal !== 'WORKER_READY') {
+    if ($signal !== 'SERVICE_READY_FOR_LOCK') {
         $err = stream_get_contents($pipes[2]);
+        $rawOut = stream_get_contents($pipes[1]);
         proc_close($proc);
-        throw new RuntimeException("Proceso B no respondió WORKER_READY. Detalle: " . $err);
+        echo "----------------------------------------------------------------------\n";
+        echo "[PRUEBA NO EJECUTADA - SERVICIO NO DISPONIBLE]\n";
+        echo "El Proceso B no pudo inicializar el servicio real de Laravel.\n";
+        echo "Detalle recibido: " . ($signal ?: $err ?: $rawOut) . "\n";
+        echo "Por directriz de seguridad, no se aprueba mediante fallback simulado.\n";
+        echo "----------------------------------------------------------------------\n";
+        exit(1);
     }
-    echo "      -> Proceso B conectado y ejecutando servicio de reconciliación.\n";
-    echo "      -> Motor MySQL InnoDB retiene a Proceso B en LOCK WAIT esperando por fila #{$mgmtId}.\n";
+    echo "      -> Proceso B arrancó Laravel y conectó a la base aislada.\n";
+    echo "      -> Proceso B invoca AdvisorAssignmentResolver::reconcilePendingLeads().\n";
+    echo "      -> Motor MySQL InnoDB suspende a Proceso B en LOCK WAIT esperando por fila #{$mgmtId}.\n";
 
-    // 4. Proceso A retiene el bloqueo intencionalmente por 1.4 segundos para verificar espera efectiva
+    // 4. Proceso A retiene el bloqueo intencionalmente por 1.4 segundos
+    // Esto demuestra de forma irrefutable que Proceso B está bloqueado esperando antes del commit
     $holdSeconds = 1.4;
-    echo "[4/6] Proceso A retiene el bloqueo por {$holdSeconds}s (verificación de espera física)...\n";
+    echo "[4/6] Proceso A retiene el bloqueo por {$holdSeconds}s (verificación de espera física de la consulta)...\n";
     usleep((int)($holdSeconds * 1000000));
 
     // 5. Proceso A realiza la asignación manual (usuario ID 99) y ejecuta COMMIT
@@ -422,7 +429,7 @@ try {
     echo "      -> COMMIT completado. Bloqueo de fila liberado en InnoDB.\n";
 
     // 6. Proceso B se desbloquea y completa su ejecución
-    echo "[6/6] Esperando desbloqueo y finalización del Proceso B...\n";
+    echo "[6/6] Esperando desbloqueo y finalización del servicio real en Proceso B...\n";
     $workerOut = stream_get_contents($pipes[1]);
     $workerErr = stream_get_contents($pipes[2]);
     fclose($pipes[0]);
@@ -436,19 +443,31 @@ try {
         exit(1);
     }
 
-    $waited = $data['waited_seconds'] ?? 0;
+    $lockWaited = $data['lock_wait_seconds'] ?? 0;
     echo "      -> Proceso B finalizó exitosamente (código 0).\n";
-    echo "      -> Modo verificado: " . ($data['tested_mode'] ?? 'desconocido') . "\n";
-    if (!empty($data['service'])) {
-        echo "      -> Servicio probado: {$data['service']}\n";
-    }
-    echo "      -> Tiempo de espera efectivo de Proceso B en InnoDB: {$waited} segundos.\n";
+    echo "      -> Servicio probado: " . ($data['service_executed'] ?? 'desconocido') . "\n";
+    echo "      -> Tiempo de espera efectivo de la operación en InnoDB: {$lockWaited} segundos (excluye arranque de Laravel).\n";
 
     // Comprobación de que esperó efectivamente el bloqueo (al menos el 70% del tiempo de retención)
-    if ($waited < ($holdSeconds * 0.7)) {
-        echo "✗ ERROR: Proceso B no esperó efectivamente el bloqueo (esperó {$waited}s, requerido >= " . ($holdSeconds * 0.7) . "s).\n";
+    if ($lockWaited < ($holdSeconds * 0.7)) {
+        echo "✗ ERROR: Proceso B no esperó efectivamente el bloqueo de fila (esperó {$lockWaited}s, requerido >= " . ($holdSeconds * 0.7) . "s).\n";
         exit(1);
     }
+
+    // Comprobación de resultado del servicio
+    $resolverResult = $data['resolver_result'] ?? [];
+    echo "      -> Resultado del servicio: reconciliados={$resolverResult['reconciled']}, omitidos por manual={$resolverResult['skipped_manual']}, pendientes={$resolverResult['unresolved']}.\n";
+    if (($resolverResult['skipped_manual'] ?? 0) !== 1) {
+        echo "✗ ERROR: El servicio de reconciliación no reportó skipped_manual = 1.\n";
+        exit(1);
+    }
+
+    // Comprobación de auditoría
+    if (empty($data['audit_logged'])) {
+        echo "✗ ERROR: No se encontró el registro de auditoría 'leads.reconciliation_preserved_manual'.\n";
+        exit(1);
+    }
+    echo "      -> Auditoría verificada: 'leads.reconciliation_preserved_manual' registrada con éxito.\n";
 
     // Comprobación de estado final en base de datos
     $stmtFinal = $pdoA->prepare("SELECT lm.assigned_user_id, l.reconciliation_pending FROM lead_management lm JOIN leads l ON l.id = lm.lead_id WHERE lm.id = :id");
@@ -458,12 +477,18 @@ try {
     if ((int)$final['assigned_user_id'] === 99 && (int)$final['reconciliation_pending'] === 0) {
         echo "\n======================================================================\n";
         echo "✓ PRUEBA APROBADA EXITOSAMENTE:\n";
-        echo "  1. Base de datos aislada verificada: {$database}.\n";
-        echo "  2. Proceso B esperó efectivamente {$waited}s en LOCK WAIT de InnoDB.\n";
-        echo "  3. Servicio real de reconciliación ejecutado y verificado.\n";
-        echo "  4. Asignación manual preservada (ID 99) sin sobrescritura.\n";
-        echo "  5. Reconciliación completada (reconciliation_pending = 0).\n";
+        echo "  1. Base de datos de prueba aislada comprobada: {$database}.\n";
+        echo "  2. Proceso B sincronizado: arrancó Laravel y solicitó bloqueo ANTES del commit.\n";
+        echo "  3. Tiempo de espera medido estrictamente sobre la consulta: {$lockWaited}s.\n";
+        echo "  4. Servicio real AdvisorAssignmentResolver ejecutado con éxito.\n";
+        echo "  5. Asignación manual preservada (ID 99) sin sobrescritura.\n";
+        echo "  6. Auditoría 'leads.reconciliation_preserved_manual' verificada.\n";
         echo "======================================================================\n";
+
+        // Registrar bandera de ejecución exitosa para prevenir repetición en Cron
+        if ($flagFile) {
+            @file_put_contents($flagFile, date('Y-m-d H:i:s T') . ' - Ejecución única exitosa');
+        }
     } else {
         echo "✗ ERROR: Inconsistencia final en base de datos.\n";
         exit(1);

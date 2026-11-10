@@ -16,8 +16,11 @@ class MySQLConcurrencyTest extends TestCase
      *    NUNCA utiliza DB_DATABASE como alternativa ni se ejecuta sobre bases de producción.
      * 2. Si MYSQL_TEST_DATABASE no está configurada o MySQL no está disponible, la prueba
      *    se marca explícitamente como OMITIDA (SKIPPED) en PHPUnit.
-     * 3. Comprueba que el Proceso B esperó efectivamente en LOCK WAIT de InnoDB.
-     * 4. Valida la preservación estricta de asignación manual tras la espera.
+     * 3. Sincroniza ambos procesos demostrando que el Proceso B intenta adquirir el bloqueo
+     *    ANTES del commit del Proceso A.
+     * 4. Mide estrictamente el tiempo de espera de la operación de bloqueo, no el arranque de Laravel.
+     * 5. Comprueba el servicio real de Laravel (AdvisorAssignmentResolver::reconcilePendingLeads),
+     *    la auditoría y la preservación de la asignación manual.
      */
     public function test_two_concurrent_processes_respect_innodb_row_lock_and_preserve_manual_assignment(): void
     {
@@ -28,11 +31,11 @@ class MySQLConcurrencyTest extends TestCase
         $password = env('MYSQL_TEST_PASSWORD', '');
 
         if (empty($database)) {
-            $this->markTestSkipped('PRUEBA OMITIDA: No se configuró explícitamente MYSQL_TEST_DATABASE. Esta prueba de concurrencia real requiere un servidor MySQL/MariaDB con InnoDB y una base de datos aislada (ej. tusoluc1_crm_test). Por seguridad, nunca utiliza DB_DATABASE como alternativa.');
+            $this->markTestSkipped('PRUEBA PENDIENTE / OMITIDA: No se configuró explícitamente MYSQL_TEST_DATABASE. Esta prueba de concurrencia real requiere un servidor MySQL/MariaDB con InnoDB y una base de datos aislada (ej. tusoluc1_crm_test). Por seguridad, nunca utiliza DB_DATABASE como alternativa.');
         }
 
         if (empty($username)) {
-            $this->markTestSkipped('PRUEBA OMITIDA: No se configuró explícitamente MYSQL_TEST_USERNAME para la base de pruebas aislada.');
+            $this->markTestSkipped('PRUEBA PENDIENTE / OMITIDA: No se configuró explícitamente MYSQL_TEST_USERNAME para la base de pruebas aislada.');
         }
 
         $appDb = env('DB_DATABASE');
@@ -52,15 +55,18 @@ class MySQLConcurrencyTest extends TestCase
                 PDO::ATTR_TIMEOUT => 3,
             ]);
         } catch (PDOException $e) {
-            $this->markTestSkipped('PRUEBA OMITIDA: No se pudo conectar al servidor MySQL/MariaDB en ' . $host . ':' . $port . ' (' . $e->getMessage() . '). Prueba no ejecutada en este entorno.');
+            $this->markTestSkipped('PRUEBA PENDIENTE / OMITIDA: No se pudo conectar al servidor MySQL/MariaDB en ' . $host . ':' . $port . ' (' . $e->getMessage() . '). Prueba no ejecutada en este entorno.');
         }
 
         $result = $this->executeTwoProcessConcurrencyVerification($pdoA, (string)$host, (string)$port, (string)$database, (string)$username, (string)$password);
 
         $this->assertTrue($result['success'], $result['message'] ?? 'Falló la verificación de concurrencia');
-        $this->assertGreaterThanOrEqual(0.8, $result['waited_seconds'], 'El Proceso B debió esperar efectivamente bloqueado mientras el Proceso A retuvo el bloqueo exclusivo');
+        $this->assertEquals('AdvisorAssignmentResolver::reconcilePendingLeads', $result['service_executed']);
+        $this->assertGreaterThanOrEqual(0.8, $result['lock_wait_seconds'], 'El Proceso B debió esperar efectivamente bloqueado mientras el Proceso A retuvo el bloqueo exclusivo');
+        $this->assertTrue($result['audit_logged'], 'El servicio real debió registrar la auditoría leads.reconciliation_preserved_manual');
+        $this->assertEquals(1, $result['resolver_result']['skipped_manual'] ?? 0, 'El resultado del servicio debió reportar 1 lead omitido por asignación manual');
         $this->assertEquals(99, $result['final_assigned_user_id'], 'La asignación manual (ID 99) debió ser preservada');
-        $this->assertEquals(0, $result['final_reconciliation_pending'], 'El lead debe quedar con reconciliación completada');
+        $this->assertEquals(0, $result['final_reconciliation_pending'], 'El lead debe quedar con reconciliación completada (0)');
     }
 
     private function executeTwoProcessConcurrencyVerification(
@@ -124,7 +130,9 @@ class MySQLConcurrencyTest extends TestCase
                 target_id VARCHAR(100) NULL,
                 payload JSON NULL,
                 created_at TIMESTAMP NULL,
-                updated_at TIMESTAMP NULL
+                updated_at TIMESTAMP NULL,
+                INDEX idx_target (target_id),
+                INDEX idx_action (action)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
             CREATE TABLE IF NOT EXISTS activities (
@@ -172,6 +180,7 @@ class MySQLConcurrencyTest extends TestCase
                 'MYSQL_TEST_DATABASE' => $database,
                 'MYSQL_TEST_USERNAME' => $username,
                 'MYSQL_TEST_PASSWORD' => $password,
+                'CONCURRENCY_FLAG_FILE' => sys_get_temp_dir() . '/concurrency_test_phpunit.flag',
             ]);
 
             $cmd = escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg($workerScript) . ' --worker'
@@ -184,13 +193,15 @@ class MySQLConcurrencyTest extends TestCase
                 return ['success' => false, 'message' => 'No se pudo iniciar el subproceso B'];
             }
 
-            // Esperar que Proceso B confirme conexión e inicio de consulta bloqueada
+            // SINCRONIZACIÓN EXACTA:
+            // Esperar que Proceso B confirme que Laravel arrancó y está por invocar el servicio de reconciliación
             $readySignal = trim(fgets($pipes[1]));
-            if ($readySignal !== 'WORKER_READY') {
+            if ($readySignal !== 'SERVICE_READY_FOR_LOCK') {
                 $err = stream_get_contents($pipes[2]);
+                $rawOut = stream_get_contents($pipes[1]);
                 proc_close($process);
                 $pdoA->rollBack();
-                return ['success' => false, 'message' => 'Proceso B no respondió WORKER_READY: ' . $err];
+                return ['success' => false, 'message' => 'Proceso B no respondió SERVICE_READY_FOR_LOCK: ' . ($readySignal ?: $err ?: $rawOut)];
             }
 
             // 4. Proceso A retiene el bloqueo intencionalmente por 1.4 segundos
@@ -231,7 +242,10 @@ class MySQLConcurrencyTest extends TestCase
 
             return [
                 'success' => true,
-                'waited_seconds' => $workerData['waited_seconds'] ?? 0,
+                'service_executed' => $workerData['service_executed'] ?? '',
+                'lock_wait_seconds' => $workerData['lock_wait_seconds'] ?? 0,
+                'resolver_result' => $workerData['resolver_result'] ?? [],
+                'audit_logged' => !empty($workerData['audit_logged']),
                 'final_assigned_user_id' => (int) $finalMgmt['assigned_user_id'],
                 'final_reconciliation_pending' => (int) $finalLead['reconciliation_pending'],
             ];
