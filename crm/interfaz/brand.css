@@ -1,0 +1,16 @@
+/* Identidad TSF: paleta y tipografía del repositorio oficial. */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+:root{--ink:#003A8C;--muted:#68768a;--line:#e2e7ed;--bg:#F5F6F7;--blue:#003A8C;--soft:#eaf1fb;--gold:#D4A857;--gold-dark:#B38A3C;--royal:#0057D9}
+body{font-family:Inter,system-ui,-apple-system,'Segoe UI',sans-serif}
+aside{border-top:4px solid var(--gold)}
+.brand-logo{display:block;width:100%;max-width:150px;height:auto;aspect-ratio:1;object-fit:contain;border-radius:8px}
+.brand small{display:block;margin-top:8px;color:#68768a}
+.login-card .brand-logo{max-width:112px}
+.nav button.active{color:var(--ink);background:var(--soft);box-shadow:inset 3px 0 var(--gold)}
+.primary{background:var(--gold);border-color:var(--gold);color:#1d2e49}
+.primary:hover{background:var(--gold-dark);border-color:var(--gold-dark);color:#fff}
+.link,.preview-button{color:var(--royal)}
+.icon{color:var(--ink);background:var(--soft)}
+.tabs button.active{border-color:var(--gold);color:var(--ink)}
+button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:3px solid var(--gold)}
+@media(max-width:700px){.mobile-nav button.active{color:var(--ink)}.login-card .brand-logo{max-width:96px}}
