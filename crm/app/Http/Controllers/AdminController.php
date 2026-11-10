@@ -3,12 +3,15 @@
 namespace App\Http\Controllers;
 
 use App\Models\AuditEvent;
+use App\Models\Lead;
 use App\Models\SyncRun;
 use App\Models\User;
+use App\Services\AdvisorAssignmentResolver;
 use App\Services\GoogleSheetsReaderService;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Validation\Rule;
 use Illuminate\View\View;
 use Throwable;
@@ -27,11 +30,14 @@ class AdminController extends Controller
             && file_exists((string) config('services.sheets.service_account_path'))
             && !empty(config('services.sheets.spreadsheet_id'));
 
+        $pendingReconciliationCount = Lead::where('reconciliation_pending', true)->count();
+
         return view('admin.index', [
             'users' => $users,
             'recentSyncs' => $recentSyncs,
             'recentAudits' => $recentAudits,
             'sheetsConfigured' => $sheetsConfigured,
+            'pendingReconciliationCount' => $pendingReconciliationCount,
         ]);
     }
 
@@ -93,6 +99,15 @@ class AdminController extends Controller
             return back()->withErrors(['error' => 'La cuenta de servicio o el ID de la planilla no están configurados en el archivo privado .env']);
         }
 
+        $lock = Cache::lock(GoogleSheetsReaderService::SYNC_LOCK_KEY, GoogleSheetsReaderService::SYNC_LOCK_TTL);
+
+        if (!$lock->get()) {
+            AuditEvent::log('sync.manual_skipped_overlap', Auth::id(), null, [
+                'reason' => 'Ya existe una sincronización en curso (manual o programada).',
+            ]);
+            return back()->withErrors(['error' => 'Ya existe una sincronización en curso (manual o programada). Por favor espera a que finalice.']);
+        }
+
         try {
             $token = $this->sheetsService->getAccessTokenFromServiceAccount($serviceAccountPath);
 
@@ -103,9 +118,34 @@ class AdminController extends Controller
 
             $syncRun = $this->sheetsService->syncDataset($sheetsData);
 
-            return redirect()->route('admin.index')->with('status', "Sincronización completada. Leídos: {$syncRun->rows_read}, Guardados: {$syncRun->rows_saved}, Rechazados: {$syncRun->rows_rejected}");
+            AuditEvent::log('sync.manual_completed', Auth::id(), null, [
+                'sync_run_id' => $syncRun->id,
+                'rows_read' => $syncRun->rows_read,
+                'rows_saved' => $syncRun->rows_saved,
+                'rows_rejected' => $syncRun->rows_rejected,
+            ]);
+
+            return redirect()->route('admin.index')->with('status', "Sincronización manual completada. Leídos: {$syncRun->rows_read}, Guardados: {$syncRun->rows_saved}, Rechazados: {$syncRun->rows_rejected}");
         } catch (Throwable $e) {
+            AuditEvent::log('sync.manual_failed', Auth::id(), null, [
+                'error' => $e->getMessage(),
+            ]);
             return back()->withErrors(['error' => 'Error durante la sincronización: ' . $e->getMessage()]);
+        } finally {
+            $lock->release();
+        }
+    }
+
+    public function reconcileLeads(): RedirectResponse
+    {
+        try {
+            $result = AdvisorAssignmentResolver::reconcilePendingLeads(actorUserId: Auth::id());
+
+            $msg = "Reconciliación de prospectos completada. Reconciliados: {$result['reconciled']}, Asignaciones manuales preservadas: {$result['skipped_manual']}, Pendientes sin resolver: {$result['unresolved']}.";
+
+            return redirect()->route('admin.index')->with('status', $msg);
+        } catch (Throwable $e) {
+            return back()->withErrors(['error' => 'Error durante la reconciliación: ' . $e->getMessage()]);
         }
     }
 }

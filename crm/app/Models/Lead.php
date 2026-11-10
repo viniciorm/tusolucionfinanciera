@@ -35,6 +35,15 @@ class Lead extends Model
         'last_seen_at' => 'datetime',
     ];
 
+    protected static function booted(): void
+    {
+        static::creating(function (Lead $lead): void {
+            if (empty($lead->source_key)) {
+                $lead->source_key = sha1(($lead->source_sheet ?? 'Hoja') . '_' . ($lead->meta_id ?? uniqid('lead_', true)));
+            }
+        });
+    }
+
     public function management(): HasOne
     {
         return $this->hasOne(LeadManagement::class, 'lead_id');

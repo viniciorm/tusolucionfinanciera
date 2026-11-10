@@ -20,6 +20,8 @@ class GoogleSheetsReaderService
     public const GOOGLE_TOKEN_URI = 'https://oauth2.googleapis.com/token';
     public const SHEETS_API_BASE = 'https://sheets.googleapis.com/v4/spreadsheets';
     public const READONLY_SCOPE = 'https://www.googleapis.com/auth/spreadsheets.readonly';
+    public const SYNC_LOCK_KEY = 'crm_sheets_sync_shared_lock';
+    public const SYNC_LOCK_TTL = 600; // 10 minutos de protección máxima
 
     public function __construct(
         private readonly ?SheetLeadNormalizer $normalizer = null,

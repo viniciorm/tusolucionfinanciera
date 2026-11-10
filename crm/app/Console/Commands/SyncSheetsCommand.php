@@ -20,16 +20,16 @@ class SyncSheetsCommand extends Command implements Isolatable
     {
         $this->info('[' . date('Y-m-d H:i:s') . '] Iniciando verificación de sincronización programada...');
 
-        // 1. Protección contra ejecuciones superpuestas
-        $lockKey = 'crm_sync_sheets_execution_lock';
-        $lockDurationSeconds = 600; // 10 minutos máximo de bloqueo
+        // 1. Protección contra ejecuciones superpuestas compartida con sincronización manual
+        $lockKey = GoogleSheetsReaderService::SYNC_LOCK_KEY;
+        $lockDurationSeconds = GoogleSheetsReaderService::SYNC_LOCK_TTL;
 
         $lock = Cache::lock($lockKey, $lockDurationSeconds);
 
         if (!$this->option('force') && !$lock->get()) {
-            $this->warn('ADVERTENCIA: Ya existe una instancia de sincronización en ejecución. Omitiendo tarea para evitar colisiones.');
+            $this->warn('ADVERTENCIA: Ya existe una instancia de sincronización en ejecución (manual o programada). Omitiendo tarea para evitar colisiones.');
             AuditEvent::log('sync.skipped_overlap', null, null, [
-                'reason' => 'Otra tarea programada ya está ejecutándose.',
+                'reason' => 'Otra instancia de sincronización ya está ejecutándose.',
             ]);
             return self::SUCCESS;
         }

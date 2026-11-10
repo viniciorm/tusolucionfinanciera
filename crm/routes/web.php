@@ -48,5 +48,6 @@ Route::middleware(['auth', 'auth.crm'])->group(function () {
         Route::post('/users', [AdminController::class, 'createUser'])->name('users.create');
         Route::post('/users/{id}/toggle', [AdminController::class, 'toggleUserStatus'])->name('users.toggle')->whereNumber('id');
         Route::post('/sync', [AdminController::class, 'triggerSync'])->name('sync');
+        Route::post('/reconcile-leads', [AdminController::class, 'reconcileLeads'])->name('reconcile_leads');
     });
 });

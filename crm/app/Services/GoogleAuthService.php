@@ -4,19 +4,24 @@ namespace App\Services;
 
 use App\Models\AuditEvent;
 use App\Models\User;
+use Firebase\JWT\JWK;
+use Firebase\JWT\JWT;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Str;
 use RuntimeException;
+use Throwable;
 use TSF\Security\GoogleAccountBinding;
 
 class GoogleAuthService
 {
     public const GOOGLE_AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
     public const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
-    public const GOOGLE_TOKENINFO_URL = 'https://oauth2.googleapis.com/tokeninfo';
+    public const GOOGLE_JWKS_URL = 'https://www.googleapis.com/oauth2/v3/certs';
     public const GOOGLE_USERINFO_URL = 'https://www.googleapis.com/oauth2/v3/userinfo';
+    public const JWKS_CACHE_KEY = 'google_oauth2_jwks';
 
     public function getAuthorizationUrl(Request $request): string
     {
@@ -124,30 +129,104 @@ class GoogleAuthService
     }
 
     /**
-     * Verifica la validez criptográfica, emisor, audiencia y expiración del id_token con Google.
+     * Obtiene el conjunto de claves públicas JWKS de Google (https://www.googleapis.com/oauth2/v3/certs).
+     * Aplica almacenamiento en caché respetando la directiva Cache-Control con soporte para refresco forzado.
+     *
+     * @throws RuntimeException
+     */
+    public function getGooglePublicKeys(bool $forceRefresh = false): array
+    {
+        if (!$forceRefresh) {
+            $cached = Cache::get(self::JWKS_CACHE_KEY);
+            if (is_array($cached) && !empty($cached['keys'])) {
+                return $cached;
+            }
+        }
+
+        $response = Http::timeout(10)->get(self::GOOGLE_JWKS_URL);
+        if (!$response->successful()) {
+            throw new RuntimeException('No se pudieron obtener las claves públicas de Google para verificar el id_token.');
+        }
+
+        $jwks = $response->json();
+        if (!is_array($jwks) || empty($jwks['keys'])) {
+            throw new RuntimeException('Formato de claves públicas (JWKS) de Google inválido.');
+        }
+
+        $cacheControl = (string) ($response->header('Cache-Control') ?? '');
+        $ttl = 3600;
+        if (preg_match('/max-age=(\d+)/i', $cacheControl, $matches)) {
+            $ttl = (int) $matches[1];
+        }
+
+        Cache::put(self::JWKS_CACHE_KEY, $jwks, min(max($ttl, 300), 86400));
+
+        return $jwks;
+    }
+
+    /**
+     * Verifica criptográficamente el id_token con las claves públicas de Google (JWKS).
+     * Valida firma (RS256), emisor, audiencia, expiración y rotación de claves sin recurrir a tokeninfo.
      *
      * @throws RuntimeException
      */
     public function verifyGoogleIdToken(string $idToken, string $expectedAudience): array
     {
-        $response = Http::timeout(10)->get(self::GOOGLE_TOKENINFO_URL, [
-            'id_token' => $idToken,
-        ]);
-
-        if (!$response->successful()) {
-            throw new RuntimeException('El id_token de Google no es válido o su firma fue rechazada.');
+        $tokenParts = explode('.', $idToken);
+        if (count($tokenParts) !== 3) {
+            throw new RuntimeException('Formato de id_token inválido (debe constar de 3 partes).');
         }
 
-        $claims = $response->json();
+        $headerJson = base64_decode(strtr($tokenParts[0], '-_', '+/'), true);
+        if (!$headerJson) {
+            throw new RuntimeException('Encabezado de id_token no es base64 válido.');
+        }
+
+        $header = json_decode($headerJson, true);
+        if (!is_array($header)) {
+            throw new RuntimeException('Encabezado de id_token no es JSON válido.');
+        }
+
+        $kid = (string) ($header['kid'] ?? '');
+        $alg = (string) ($header['alg'] ?? '');
+
+        if ($kid === '') {
+            throw new RuntimeException('El id_token no contiene kid en el encabezado.');
+        }
+        if ($alg !== 'RS256') {
+            throw new RuntimeException("Algoritmo de firma de id_token no soportado: '{$alg}'. Se requiere RS256.");
+        }
+
+        // Obtener claves públicas cacheadas
+        $jwks = $this->getGooglePublicKeys(false);
+        $keys = JWK::parseKeySet($jwks);
+
+        // Si el kid no existe en el conjunto cacheado, refrescar para manejar rotación de claves
+        if (!isset($keys[$kid])) {
+            $jwks = $this->getGooglePublicKeys(true);
+            $keys = JWK::parseKeySet($jwks);
+        }
+
+        if (!isset($keys[$kid])) {
+            throw new RuntimeException("Clave pública con kid '{$kid}' no encontrada en las claves públicas de Google tras refrescar certificados.");
+        }
+
+        try {
+            $decoded = JWT::decode($idToken, $keys);
+        } catch (Throwable $e) {
+            throw new RuntimeException('Firma criptográfica del id_token de Google rechazada: ' . $e->getMessage(), 0, $e);
+        }
+
+        $claims = (array) $decoded;
 
         // Validar emisor (iss)
-        $iss = $claims['iss'] ?? '';
+        $iss = (string) ($claims['iss'] ?? '');
         if ($iss !== 'accounts.google.com' && $iss !== 'https://accounts.google.com') {
-            throw new RuntimeException('Emisor (iss) de Google no reconocido.');
+            throw new RuntimeException("Emisor (iss) de Google no reconocido: '{$iss}'.");
         }
 
         // Validar audiencia (aud)
-        $aud = $claims['aud'] ?? '';
+        $aud = (string) ($claims['aud'] ?? '');
         if ($aud !== $expectedAudience) {
             throw new RuntimeException('Audiencia (aud) de Google no coincide con el cliente configurado.');
         }
@@ -161,6 +240,14 @@ class GoogleAuthService
         // Validar correo verificado
         $emailVerified = $claims['email_verified'] ?? false;
         $claims['email_verified'] = ($emailVerified === true || $emailVerified === 'true');
+        if (!$claims['email_verified']) {
+            throw new RuntimeException('El correo de Google no está verificado.');
+        }
+
+        // Validar subject no vacío
+        if (empty($claims['sub'])) {
+            throw new RuntimeException('El id_token no contiene un identificador único (sub).');
+        }
 
         return $claims;
     }

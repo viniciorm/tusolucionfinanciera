@@ -18,7 +18,7 @@
             <h2>Sincronización con Google Sheets</h2>
             <p>Lectura segura de solo lectura de Hoja 2 a Hoja 5 (Hoja 1 excluida).</p>
         </div>
-        <div>
+        <div style="display: flex; gap: 8px; flex-wrap: wrap;">
             @if($sheetsConfigured)
                 <form method="POST" action="{{ route('admin.sync') }}" style="display:inline;">
                     @csrf
@@ -29,6 +29,12 @@
                     Credenciales de Google Sheets pendientes en .env
                 </span>
             @endif
+            <form method="POST" action="{{ route('admin.reconcile_leads') }}" style="display:inline;">
+                @csrf
+                <button type="submit" class="btn btn-secondary">
+                    ⚖ Reconciliar prospectos ({{ $pendingReconciliationCount }} pendientes)
+                </button>
+            </form>
         </div>
     </div>
 

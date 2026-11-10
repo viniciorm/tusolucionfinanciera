@@ -244,44 +244,252 @@ class AuthAndBindingTest extends TestCase
         );
     }
 
-    public function test_google_id_token_verification_validates_claims_and_expiration(): void
+    public function test_google_id_token_verification_succeeds_with_valid_signature_and_claims(): void
     {
-        $service = new GoogleAuthService();
-        $expectedAudience = 'my-client-id.apps.googleusercontent.com';
+        $clientId = 'test-client-id.apps.googleusercontent.com';
+        config(['services.google.client_id' => $clientId]);
 
         Http::fake([
-            'https://oauth2.googleapis.com/tokeninfo*' => Http::response([
-                'iss' => 'https://accounts.google.com',
-                'aud' => $expectedAudience,
-                'sub' => 'google-sub-tokeninfo-123',
-                'email' => 'valido@ejemplo.test',
-                'email_verified' => 'true',
-                'name' => 'Nombre Verificado',
-                'exp' => time() + 3600,
+            GoogleAuthService::GOOGLE_JWKS_URL => Http::response($this->getTestJwksResponse(['key1']), 200, [
+                'Cache-Control' => 'public, max-age=3600',
+            ]),
+        ]);
+
+        $service = new GoogleAuthService();
+        $token = $this->makeGoogleIdToken([
+            'sub' => 'google-user-sub-12345',
+            'email' => 'asesor@ejemplo.test',
+            'email_verified' => true,
+            'name' => 'Asesor de Prueba',
+        ], 'key1');
+
+        $claims = $service->verifyGoogleIdToken($token, $clientId);
+
+        $this->assertEquals('google-user-sub-12345', $claims['sub']);
+        $this->assertEquals('asesor@ejemplo.test', $claims['email']);
+        $this->assertTrue($claims['email_verified']);
+        $this->assertEquals('Asesor de Prueba', $claims['name']);
+    }
+
+    public function test_google_id_token_verification_rejects_invalid_signature(): void
+    {
+        $clientId = 'test-client-id.apps.googleusercontent.com';
+        config(['services.google.client_id' => $clientId]);
+
+        Http::fake([
+            GoogleAuthService::GOOGLE_JWKS_URL => Http::response($this->getTestJwksResponse(['key1']), 200),
+        ]);
+
+        $service = new GoogleAuthService();
+
+        // Firmado con la clave 2 pero declarando kid de la clave 1
+        $key2 = $this->getTestGoogleKey('key2');
+        $payload = [
+            'iss' => 'https://accounts.google.com',
+            'aud' => $clientId,
+            'sub' => 'sub-forged',
+            'email' => 'hacker@ejemplo.test',
+            'email_verified' => true,
+            'exp' => time() + 3600,
+        ];
+        $forgedToken = \Firebase\JWT\JWT::encode($payload, $key2['priv'], 'RS256', 'google-key-1');
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('Firma criptográfica del id_token');
+
+        $service->verifyGoogleIdToken($forgedToken, $clientId);
+    }
+
+    public function test_google_id_token_verification_rejects_invalid_issuer(): void
+    {
+        $clientId = 'test-client-id.apps.googleusercontent.com';
+        config(['services.google.client_id' => $clientId]);
+
+        Http::fake([
+            GoogleAuthService::GOOGLE_JWKS_URL => Http::response($this->getTestJwksResponse(['key1']), 200),
+        ]);
+
+        $service = new GoogleAuthService();
+        $token = $this->makeGoogleIdToken([
+            'iss' => 'https://malicious-issuer.com',
+        ], 'key1');
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('Emisor (iss) de Google no reconocido');
+
+        $service->verifyGoogleIdToken($token, $clientId);
+    }
+
+    public function test_google_id_token_verification_rejects_mismatched_audience(): void
+    {
+        $clientId = 'test-client-id.apps.googleusercontent.com';
+        config(['services.google.client_id' => $clientId]);
+
+        Http::fake([
+            GoogleAuthService::GOOGLE_JWKS_URL => Http::response($this->getTestJwksResponse(['key1']), 200),
+        ]);
+
+        $service = new GoogleAuthService();
+        $token = $this->makeGoogleIdToken([
+            'aud' => 'different-client-id.apps.googleusercontent.com',
+        ], 'key1');
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('Audiencia (aud) de Google no coincide');
+
+        $service->verifyGoogleIdToken($token, $clientId);
+    }
+
+    public function test_google_id_token_verification_rejects_expired_token(): void
+    {
+        $clientId = 'test-client-id.apps.googleusercontent.com';
+        config(['services.google.client_id' => $clientId]);
+
+        Http::fake([
+            GoogleAuthService::GOOGLE_JWKS_URL => Http::response($this->getTestJwksResponse(['key1']), 200),
+        ]);
+
+        $service = new GoogleAuthService();
+        $token = $this->makeGoogleIdToken([
+            'exp' => time() - 300,
+        ], 'key1');
+
+        $this->expectException(RuntimeException::class);
+        // La biblioteca Firebase o la verificación explícita detectan el token expirado
+        $this->expectExceptionMessageMatches('/(expirado|Expired)/i');
+
+        $service->verifyGoogleIdToken($token, $clientId);
+    }
+
+    public function test_google_id_token_verification_rejects_unverified_email(): void
+    {
+        $clientId = 'test-client-id.apps.googleusercontent.com';
+        config(['services.google.client_id' => $clientId]);
+
+        Http::fake([
+            GoogleAuthService::GOOGLE_JWKS_URL => Http::response($this->getTestJwksResponse(['key1']), 200),
+        ]);
+
+        $service = new GoogleAuthService();
+        $token = $this->makeGoogleIdToken([
+            'email_verified' => false,
+        ], 'key1');
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('El correo de Google no está verificado');
+
+        $service->verifyGoogleIdToken($token, $clientId);
+    }
+
+    public function test_google_id_token_verification_handles_key_rotation_successfully(): void
+    {
+        $clientId = 'test-client-id.apps.googleusercontent.com';
+        config(['services.google.client_id' => $clientId]);
+
+        // 1. Simular caché inicial con solo la clave 1
+        \Illuminate\Support\Facades\Cache::put(
+            GoogleAuthService::JWKS_CACHE_KEY,
+            $this->getTestJwksResponse(['key1']),
+            3600
+        );
+
+        // 2. Google publica el JWKS actualizado con la clave 1 y la nueva clave rotada 2
+        Http::fake([
+            GoogleAuthService::GOOGLE_JWKS_URL => Http::response(
+                $this->getTestJwksResponse(['key1', 'key2']),
+                200
+            ),
+        ]);
+
+        // 3. Llega un token firmado con la nueva clave rotada (key2)
+        $rotatedToken = $this->makeGoogleIdToken([
+            'sub' => 'sub-post-rotation',
+            'email' => 'asesor@ejemplo.test',
+        ], 'key2');
+
+        $service = new GoogleAuthService();
+
+        // El servicio debe detectar la ausencia del kid en caché, refrescar contra Google y validar con éxito
+        $claims = $service->verifyGoogleIdToken($rotatedToken, $clientId);
+
+        $this->assertEquals('sub-post-rotation', $claims['sub']);
+        $this->assertEquals('asesor@ejemplo.test', $claims['email']);
+    }
+
+    public function test_google_id_token_verification_rejects_unknown_key_id_after_refresh(): void
+    {
+        $clientId = 'test-client-id.apps.googleusercontent.com';
+        config(['services.google.client_id' => $clientId]);
+
+        Http::fake([
+            GoogleAuthService::GOOGLE_JWKS_URL => Http::response($this->getTestJwksResponse(['key1']), 200),
+        ]);
+
+        $key1 = $this->getTestGoogleKey('key1');
+        $payload = [
+            'iss' => 'https://accounts.google.com',
+            'aud' => $clientId,
+            'sub' => 'sub-unknown-kid',
+            'email' => 'asesor@ejemplo.test',
+            'email_verified' => true,
+            'exp' => time() + 3600,
+        ];
+        $tokenWithUnknownKid = \Firebase\JWT\JWT::encode($payload, $key1['priv'], 'RS256', 'completely-unknown-kid');
+
+        $service = new GoogleAuthService();
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage("Clave pública con kid 'completely-unknown-kid' no encontrada");
+
+        $service->verifyGoogleIdToken($tokenWithUnknownKid, $clientId);
+    }
+
+    public function test_full_oauth_callback_flow_succeeds_with_verified_id_token_and_userinfo(): void
+    {
+        $user = User::create([
+            'email' => 'admin@tusolucionfinanciera.cl',
+            'name' => 'Administrador Preautorizado',
+            'role' => 'admin',
+            'active' => true,
+            'google_subject' => null,
+        ]);
+
+        $clientId = 'test-client-id.apps.googleusercontent.com';
+        config([
+            'services.google.client_id' => $clientId,
+            'services.google.client_secret' => 'test-secret',
+            'services.google.redirect_uri' => 'https://crm.tusolucionfinanciera.cl/auth/google/callback',
+        ]);
+
+        session(['oauth_google_state' => 'state-flow-123']);
+
+        $idToken = $this->makeGoogleIdToken([
+            'sub' => 'google-sub-flow-verified',
+            'email' => 'admin@tusolucionfinanciera.cl',
+            'email_verified' => true,
+            'name' => 'Admin Nombre',
+        ], 'key1');
+
+        Http::fake([
+            GoogleAuthService::GOOGLE_TOKEN_URL => Http::response([
+                'access_token' => 'mock-access-token-flow',
+                'id_token' => $idToken,
+            ], 200),
+            GoogleAuthService::GOOGLE_JWKS_URL => Http::response($this->getTestJwksResponse(['key1']), 200),
+            GoogleAuthService::GOOGLE_USERINFO_URL => Http::response([
+                'sub' => 'google-sub-flow-verified',
+                'email' => 'admin@tusolucionfinanciera.cl',
+                'email_verified' => true,
+                'name' => 'Admin Nombre',
             ], 200),
         ]);
 
-        $claims = $service->verifyGoogleIdToken('mock-id-token-xyz', $expectedAudience);
+        $response = $this->get('/auth/google/callback?code=mock-code&state=state-flow-123');
 
-        $this->assertEquals('google-sub-tokeninfo-123', $claims['sub']);
-        $this->assertEquals('valido@ejemplo.test', $claims['email']);
-        $this->assertTrue($claims['email_verified']);
-    }
+        $response->assertRedirect('/dashboard');
+        $this->assertAuthenticatedAs($user);
 
-    public function test_google_id_token_verification_rejects_invalid_token(): void
-    {
-        $service = new GoogleAuthService();
-
-        Http::fake([
-            'https://oauth2.googleapis.com/tokeninfo*' => Http::response([
-                'error' => 'invalid_token',
-                'error_description' => 'Invalid Value',
-            ], 400),
-        ]);
-
-        $this->expectException(RuntimeException::class);
-        $this->expectExceptionMessage('no es válido');
-
-        $service->verifyGoogleIdToken('invalid-token', 'my-client-id');
+        $user->refresh();
+        $this->assertEquals('google-sub-flow-verified', $user->google_subject);
     }
 }
