@@ -113,10 +113,17 @@ class AdminController extends Controller
 
             $sheetsData = [];
             foreach (GoogleSheetsReaderService::ALLOWED_SHEETS as $sheetName) {
+                if (method_exists($lock, 'refresh')) {
+                    try { $lock->refresh(GoogleSheetsReaderService::SYNC_LOCK_TTL); } catch (Throwable) {}
+                }
                 $sheetsData[$sheetName] = $this->sheetsService->fetchSheetValues($token, $spreadsheetId, $sheetName);
             }
 
-            $syncRun = $this->sheetsService->syncDataset($sheetsData);
+            $syncRun = $this->sheetsService->syncDataset($sheetsData, function () use ($lock): void {
+                if (method_exists($lock, 'refresh')) {
+                    try { $lock->refresh(GoogleSheetsReaderService::SYNC_LOCK_TTL); } catch (Throwable) {}
+                }
+            });
 
             AuditEvent::log('sync.manual_completed', Auth::id(), null, [
                 'sync_run_id' => $syncRun->id,

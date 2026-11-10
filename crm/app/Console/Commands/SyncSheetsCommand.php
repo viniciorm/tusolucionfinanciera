@@ -26,7 +26,21 @@ class SyncSheetsCommand extends Command implements Isolatable
 
         $lock = Cache::lock($lockKey, $lockDurationSeconds);
 
-        if (!$this->option('force') && !$lock->get()) {
+        if ($this->option('force')) {
+            $this->warn('Opción --force detectada: liberando forzosamente cualquier bloqueo previo residual...');
+            try {
+                if (method_exists($lock, 'forceRelease')) {
+                    $lock->forceRelease();
+                }
+            } catch (Throwable) {
+                // Continuar
+            }
+            AuditEvent::log('sync.forced_lock_release', null, null, [
+                'reason' => 'Liberación forzada mediante opción --force en consola CLI',
+            ]);
+        }
+
+        if (!$lock->get()) {
             $this->warn('ADVERTENCIA: Ya existe una instancia de sincronización en ejecución (manual o programada). Omitiendo tarea para evitar colisiones.');
             AuditEvent::log('sync.skipped_overlap', null, null, [
                 'reason' => 'Otra instancia de sincronización ya está ejecutándose.',
@@ -53,16 +67,19 @@ class SyncSheetsCommand extends Command implements Isolatable
             $this->line('Obteniendo token de acceso con permisos exclusivos de solo lectura...');
             $token = $sheetsService->getAccessTokenFromServiceAccount($serviceAccountPath);
 
-            // 4. Lectura segura exclusivamente de las hojas autorizadas (Hoja 2 a 5)
+            // 4. Lectura segura exclusivamente de las hojas autorizadas (Hoja 2 a 5) con heartbeat de bloqueo
             $sheetsData = [];
             foreach (GoogleSheetsReaderService::ALLOWED_SHEETS as $sheetName) {
+                $this->refreshLockHeartbeat($lock);
                 $this->line("Consultando '$sheetName' vía Google Sheets API v4...");
                 $sheetsData[$sheetName] = $sheetsService->fetchSheetValues($token, $spreadsheetId, $sheetName);
             }
 
-            // 5. Procesamiento idempotente
+            // 5. Procesamiento idempotente con renovación de bloqueo para tareas extensas (>600s)
             $this->line('Procesando datos y aplicando reglas de asignación y persistencia...');
-            $syncRun = $sheetsService->syncDataset($sheetsData);
+            $syncRun = $sheetsService->syncDataset($sheetsData, function () use ($lock): void {
+                $this->refreshLockHeartbeat($lock);
+            });
 
             $this->info("✓ Sincronización completada exitosamente (ID de ejecución #{$syncRun->id}).");
             $this->table(
@@ -81,6 +98,20 @@ class SyncSheetsCommand extends Command implements Isolatable
             return self::FAILURE;
         } finally {
             $lock->release();
+        }
+    }
+
+    /**
+     * Extiende el TTL del bloqueo para evitar expiración en sincronizaciones prolongadas (> 600s).
+     */
+    protected function refreshLockHeartbeat($lock): void
+    {
+        try {
+            if (method_exists($lock, 'refresh')) {
+                $lock->refresh(GoogleSheetsReaderService::SYNC_LOCK_TTL);
+            }
+        } catch (Throwable) {
+            // No interrumpir si el driver de prueba no implementa refresh
         }
     }
 }

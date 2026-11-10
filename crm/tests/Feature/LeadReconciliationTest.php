@@ -263,4 +263,66 @@ class LeadReconciliationTest extends TestCase
         $response->assertSessionHas('status');
         $this->assertStringContainsString('Reconciliación de prospectos completada', session('status'));
     }
+
+    public function test_concurrent_manual_assignment_is_not_overwritten_by_reconciliation(): void
+    {
+        $manualAdvisor = User::create([
+            'email' => 'asesor_concurrente@tusolucionfinanciera.cl',
+            'name' => 'Asesor Manual Concurrente',
+            'role' => 'advisor',
+            'active' => true,
+        ]);
+
+        $paoUser = User::create([
+            'email' => 'pao@tusolucionfinanciera.cl',
+            'name' => 'Paola Asesora',
+            'role' => 'advisor',
+            'active' => true,
+        ]);
+
+        config(['services.advisors.mappings' => [
+            'pao' => 'pao@tusolucionfinanciera.cl',
+        ]]);
+
+        $lead = Lead::create([
+            'source_sheet' => 'Hoja 3',
+            'meta_id' => 'lead-race-condition',
+            'name' => 'Cliente Carrera Concurrente',
+            'email' => 'race@test.cl',
+            'source_assigned_to' => 'Pao',
+            'reconciliation_pending' => true,
+            'original' => ['id' => 'lead-race-condition'],
+        ]);
+        LeadManagement::create([
+            'lead_id' => $lead->id,
+            'status' => 'Nuevo',
+            'assigned_user_id' => null, // Inicialmente sin asignar
+        ]);
+
+        // Simular que justo después de la lectura preliminar, un admin asigna manualmente el lead en la BD
+        $firstRead = true;
+        Lead::retrieved(function ($model) use (&$firstRead, $manualAdvisor, $lead) {
+            if ($firstRead && $model->id === $lead->id) {
+                $firstRead = false;
+                \Illuminate\Support\Facades\DB::table('lead_management')
+                    ->where('lead_id', $lead->id)
+                    ->update(['assigned_user_id' => $manualAdvisor->id]);
+            }
+        });
+
+        $result = AdvisorAssignmentResolver::reconcilePendingLeads();
+
+        $this->assertEquals(0, $result['reconciled'], 'No debió asignarse a Pao');
+        $this->assertEquals(1, $result['skipped_manual'], 'Debió preservarse la asignación manual adquirida concurrentemente');
+
+        $lead->refresh();
+        $this->assertEquals($manualAdvisor->id, $lead->management->assigned_user_id);
+        $this->assertNotEquals($paoUser->id, $lead->management->assigned_user_id);
+        $this->assertFalse($lead->reconciliation_pending);
+
+        $this->assertDatabaseHas('audit_events', [
+            'action' => 'leads.reconciliation_preserved_manual',
+            'lead_id' => $lead->id,
+        ]);
+    }
 }

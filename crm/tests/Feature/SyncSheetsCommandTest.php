@@ -46,6 +46,43 @@ class SyncSheetsCommandTest extends TestCase
         $lock->release();
     }
 
+    public function test_force_option_breaks_stale_lock_and_executes_successfully(): void
+    {
+        // 1. Simular un bloqueo huérfano dejado por un proceso que murió
+        $staleLock = Cache::lock(GoogleSheetsReaderService::SYNC_LOCK_KEY, GoogleSheetsReaderService::SYNC_LOCK_TTL);
+        $this->assertTrue($staleLock->get());
+
+        $tempKeyPath = tempnam(sys_get_temp_dir(), 'sa_force_test');
+        file_put_contents($tempKeyPath, json_encode([
+            'client_email' => 'sa@test.iam.gserviceaccount.com',
+            'private_key' => 'mock-key',
+        ]));
+        config(['services.sheets.service_account_path' => $tempKeyPath]);
+        config(['services.sheets.spreadsheet_id' => 'test-spreadsheet-123']);
+
+        $mockService = $this->createPartialMock(GoogleSheetsReaderService::class, ['getAccessTokenFromServiceAccount', 'fetchSheetValues']);
+        $mockService->expects($this->atLeastOnce())->method('getAccessTokenFromServiceAccount')->willReturn('mock-access-token');
+        $mockService->expects($this->atLeastOnce())->method('fetchSheetValues')->willReturn([
+            ['id', 'full_name', 'email', 'phone'],
+            ['m-force-1', 'Lead Forzado', 'force@test.cl', '+56911112222'],
+        ]);
+        $this->app->instance(GoogleSheetsReaderService::class, $mockService);
+
+        // 2. Invocar con --force
+        $exitCode = Artisan::call('crm:sync-sheets', ['--force' => true]);
+        $output = Artisan::output();
+
+        $this->assertEquals(0, $exitCode);
+        $this->assertStringContainsString('Opción --force detectada', $output);
+        $this->assertStringContainsString('Sincronización completada exitosamente', $output);
+
+        $this->assertDatabaseHas('audit_events', [
+            'action' => 'sync.forced_lock_release',
+        ]);
+
+        @unlink($tempKeyPath);
+    }
+
     public function test_manual_sync_is_blocked_when_command_holds_shared_lock(): void
     {
         $admin = User::create([

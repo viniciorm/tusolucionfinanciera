@@ -111,8 +111,9 @@ class GoogleSheetsReaderService
 
     /**
      * Ejecuta una sincronización completa e idempotente a partir de matrices de datos.
+     * Permite pasar un callback de heartbeat para extender bloqueos en ejecuciones prolongadas.
      */
-    public function syncDataset(array $sheetsData): SyncRun
+    public function syncDataset(array $sheetsData, ?callable $heartbeat = null): SyncRun
     {
         $syncRun = SyncRun::create([
             'status' => SyncRun::STATUS_RUNNING,
@@ -134,6 +135,10 @@ class GoogleSheetsReaderService
             DB::beginTransaction();
 
             foreach ($sheetsData as $sheetName => $rawRows) {
+                if ($heartbeat !== null) {
+                    $heartbeat();
+                }
+
                 if (!in_array($sheetName, self::ALLOWED_SHEETS, true)) {
                     continue; // Excluir Hoja 1 y cualquier hoja no autorizada
                 }
