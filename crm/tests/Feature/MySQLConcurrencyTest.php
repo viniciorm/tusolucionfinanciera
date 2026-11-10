@@ -18,7 +18,7 @@ class MySQLConcurrencyTest extends TestCase
      *    se marca explícitamente como OMITIDA (SKIPPED) en PHPUnit.
      * 3. Sincroniza ambos procesos demostrando que el Proceso B intenta adquirir el bloqueo
      *    ANTES del commit del Proceso A.
-     * 4. Mide estrictamente el tiempo de espera de la operación de bloqueo, no el arranque de Laravel.
+     * 4. Utiliza las migraciones reales del CRM (audit_events con lead_id y details).
      * 5. Comprueba el servicio real de Laravel (AdvisorAssignmentResolver::reconcilePendingLeads),
      *    la auditoría y la preservación de la asignación manual.
      */
@@ -62,8 +62,9 @@ class MySQLConcurrencyTest extends TestCase
 
         $this->assertTrue($result['success'], $result['message'] ?? 'Falló la verificación de concurrencia');
         $this->assertEquals('AdvisorAssignmentResolver::reconcilePendingLeads', $result['service_executed']);
-        $this->assertGreaterThanOrEqual(0.8, $result['lock_wait_seconds'], 'El Proceso B debió esperar efectivamente bloqueado mientras el Proceso A retuvo el bloqueo exclusivo');
+        $this->assertGreaterThanOrEqual(0.8, $result['service_elapsed_seconds'], 'El Proceso B debió esperar efectivamente bloqueado mientras el Proceso A retuvo el bloqueo exclusivo');
         $this->assertTrue($result['audit_logged'], 'El servicio real debió registrar la auditoría leads.reconciliation_preserved_manual');
+        $this->assertEquals(99, $result['audit_assigned_user_id'] ?? null, 'La auditoría oficial debió registrar details.assigned_user_id = 99');
         $this->assertEquals(1, $result['resolver_result']['skipped_manual'] ?? 0, 'El resultado del servicio debió reportar 1 lead omitido por asignación manual');
         $this->assertEquals(99, $result['final_assigned_user_id'], 'La asignación manual (ID 99) debió ser preservada');
         $this->assertEquals(0, $result['final_reconciliation_pending'], 'El lead debe quedar con reconciliación completada (0)');
@@ -77,74 +78,26 @@ class MySQLConcurrencyTest extends TestCase
         string $username,
         string $password
     ): array {
-        // Garantizar tablas mínimas en base de pruebas aislada
-        $pdoA->exec("
-            CREATE TABLE IF NOT EXISTS leads (
-                id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-                source_key VARCHAR(255) NOT NULL,
-                source_sheet VARCHAR(100) NOT NULL,
-                meta_id VARCHAR(100) NOT NULL,
-                name VARCHAR(255) NOT NULL,
-                email VARCHAR(255) NOT NULL,
-                phone VARCHAR(50) NULL,
-                phone_search VARCHAR(50) NULL,
-                received_at_raw VARCHAR(100) NULL,
-                received_at TIMESTAMP NULL,
-                campaign VARCHAR(255) NULL,
-                form VARCHAR(255) NULL,
-                notification_status VARCHAR(100) NULL,
-                source_assigned_to VARCHAR(100) NULL,
-                reconciliation_pending TINYINT(1) NOT NULL DEFAULT 1,
-                original JSON NULL,
-                last_seen_at TIMESTAMP NULL,
-                created_at TIMESTAMP NULL,
-                updated_at TIMESTAMP NULL,
-                INDEX idx_reconciliation (reconciliation_pending)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
-            CREATE TABLE IF NOT EXISTS lead_management (
-                id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-                lead_id INT UNSIGNED NOT NULL,
-                status VARCHAR(50) NOT NULL DEFAULT 'Nuevo',
-                assigned_user_id INT UNSIGNED NULL,
-                created_at TIMESTAMP NULL,
-                updated_at TIMESTAMP NULL,
-                INDEX idx_lead_id (lead_id)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
-            CREATE TABLE IF NOT EXISTS users (
-                id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-                name VARCHAR(255) NOT NULL,
-                email VARCHAR(255) NOT NULL,
-                role VARCHAR(50) NOT NULL DEFAULT 'advisor',
-                active TINYINT(1) NOT NULL DEFAULT 1,
-                created_at TIMESTAMP NULL,
-                updated_at TIMESTAMP NULL,
-                UNIQUE KEY uq_email (email)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
-            CREATE TABLE IF NOT EXISTS audit_events (
-                id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-                action VARCHAR(100) NOT NULL,
-                actor_user_id INT UNSIGNED NULL,
-                target_id VARCHAR(100) NULL,
-                payload JSON NULL,
-                created_at TIMESTAMP NULL,
-                updated_at TIMESTAMP NULL,
-                INDEX idx_target (target_id),
-                INDEX idx_action (action)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
-            CREATE TABLE IF NOT EXISTS activities (
-                id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-                lead_id INT UNSIGNED NOT NULL,
-                actor_user_id INT UNSIGNED NULL,
-                type VARCHAR(50) NOT NULL DEFAULT 'note',
-                note TEXT NULL,
-                created_at TIMESTAMP NULL,
-                updated_at TIMESTAMP NULL
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-        ");
+        // Ejecutar las migraciones reales del CRM en la base de pruebas aislada
+        config([
+            'database.default' => 'mysql_concurrency_test',
+            'database.connections.mysql_concurrency_test' => [
+                'driver' => 'mysql',
+                'host' => $host,
+                'port' => (int) $port,
+                'database' => $database,
+                'username' => $username,
+                'password' => $password,
+                'charset' => 'utf8mb4',
+                'collation' => 'utf8mb4_unicode_ci',
+                'prefix' => '',
+                'strict' => true,
+                'engine' => 'InnoDB',
+            ],
+        ]);
+        \Illuminate\Support\Facades\DB::purge('mysql_concurrency_test');
+        \Illuminate\Support\Facades\DB::setDefaultConnection('mysql_concurrency_test');
+        \Illuminate\Support\Facades\Artisan::call('migrate', ['--force' => true]);
 
         // 1. Crear lead de prueba en base de datos aislada
         $metaId = 'concurrent-test-' . bin2hex(random_bytes(6));
@@ -243,17 +196,19 @@ class MySQLConcurrencyTest extends TestCase
             return [
                 'success' => true,
                 'service_executed' => $workerData['service_executed'] ?? '',
-                'lock_wait_seconds' => $workerData['lock_wait_seconds'] ?? 0,
+                'service_elapsed_seconds' => $workerData['service_elapsed_seconds'] ?? 0,
                 'resolver_result' => $workerData['resolver_result'] ?? [],
                 'audit_logged' => !empty($workerData['audit_logged']),
+                'audit_assigned_user_id' => $workerData['audit_assigned_user_id'] ?? null,
                 'final_assigned_user_id' => (int) $finalMgmt['assigned_user_id'],
                 'final_reconciliation_pending' => (int) $finalLead['reconciliation_pending'],
             ];
         } finally {
             try {
-                $pdoA->exec("DELETE FROM lead_management WHERE id = {$mgmtId}");
+                $pdoA->exec("DELETE FROM activities WHERE lead_id = {$leadId}");
+                $pdoA->exec("DELETE FROM audit_events WHERE lead_id = {$leadId}");
+                $pdoA->exec("DELETE FROM lead_management WHERE lead_id = {$leadId}");
                 $pdoA->exec("DELETE FROM leads WHERE id = {$leadId}");
-                $pdoA->exec("DELETE FROM audit_events WHERE target_id = '{$leadId}'");
             } catch (\Throwable) {
                 // Silenciar error de limpieza
             }
