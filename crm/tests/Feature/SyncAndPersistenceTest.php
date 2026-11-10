@@ -49,30 +49,70 @@ class SyncAndPersistenceTest extends TestCase
         $this->assertEquals(3, LeadManagement::count());
     }
 
-    public function test_subsequent_syncs_strictly_preserve_commercial_statuses_and_notes(): void
+    public function test_sync_resolves_only_explicitly_mapped_advisors_and_leaves_unmapped_as_reconciliation_pending(): void
     {
         $service = new GoogleSheetsReaderService();
 
         $dataset = [
             'Hoja 2' => [
                 ['id', 'full_name', 'email', 'phone'],
-                ['meta-201', 'Roberto Diaz', 'roberto@test.cl', '+56944444444'],
+                ['meta-h2-1', 'Lead Sin Asignar', 'sin@test.cl', '+56911111111'],
+            ],
+            'Hoja 5' => [
+                ['id', 'nombre', 'correo', 'telefono', 'assigned_to'],
+                ['meta-h5-1', 'Lead de Pao', 'pao.lead@test.cl', '+56955555555', 'Pao'],
+            ],
+            'Hoja 3' => [
+                ['id', 'nombre_completo', 'correo_electrónico', 'assigned_to'],
+                ['meta-h3-1', 'Lead de Cris', 'cris.lead@test.cl', 'Cris'],
             ],
         ];
 
-        // 1. Sincronizar lead inicial
         $service->syncDataset($dataset);
-        $lead = Lead::where('meta_id', 'meta-201')->firstOrFail();
 
-        // 2. Asesor cambia estado comercial y agrega notas de gestión
+        // 1. Hoja 2: sin assigned_to de origen
+        $leadH2 = Lead::where('meta_id', 'meta-h2-1')->firstOrFail();
+        $this->assertNull($leadH2->source_assigned_to);
+        $this->assertTrue($leadH2->reconciliation_pending);
+        $this->assertNull($leadH2->management->assigned_user_id);
+
+        // 2. Hoja 5: assigned_to = 'Pao' (no habilitada todavía)
+        $leadH5 = Lead::where('meta_id', 'meta-h5-1')->firstOrFail();
+        $this->assertEquals('Pao', $leadH5->source_assigned_to); // Conservado como dato original
+        $this->assertTrue($leadH5->reconciliation_pending);     // Pendiente de conciliación
+        $this->assertNull($leadH5->management->assigned_user_id); // No inventa asignación
+
+        // 3. Hoja 3: assigned_to = 'Cris' (no habilitado todavía)
+        $leadH3 = Lead::where('meta_id', 'meta-h3-1')->firstOrFail();
+        $this->assertEquals('Cris', $leadH3->source_assigned_to);
+        $this->assertTrue($leadH3->reconciliation_pending);
+        $this->assertNull($leadH3->management->assigned_user_id);
+    }
+
+    public function test_subsequent_sync_updates_changed_source_attributes_without_overwriting_crm_status(): void
+    {
+        $service = new GoogleSheetsReaderService();
+
+        // 1. Sincronización inicial
+        $datasetInitial = [
+            'Hoja 2' => [
+                ['id', 'full_name', 'email', 'phone', 'campaign_name', 'lead_status'],
+                ['meta-update-1', 'Nombre Antiguo', 'antiguo@test.cl', '+56911111111', 'Camp A', 'pendiente'],
+            ],
+        ];
+        $service->syncDataset($datasetInitial);
+
+        $lead = Lead::where('meta_id', 'meta-update-1')->firstOrFail();
+
+        // 2. Asesor avanza gestión en el CRM
         $advisor = User::create([
-            'email' => 'asesor@test.cl',
-            'name' => 'Asesor Activo',
+            'email' => 'asesor_interno@test.cl',
+            'name' => 'Asesor Interno',
             'role' => 'advisor',
             'active' => true,
         ]);
 
-        $lead->management->status = LeadManagement::STATUS_REUNION_AGENDADA;
+        $lead->management->status = LeadManagement::STATUS_EN_SEGUIMIENTO;
         $lead->management->assigned_user_id = $advisor->id;
         $lead->management->save();
 
@@ -80,26 +120,31 @@ class SyncAndPersistenceTest extends TestCase
             'lead_id' => $lead->id,
             'actor_user_id' => $advisor->id,
             'type' => Activity::TYPE_NOTE,
-            'note' => 'Cliente muy interesado en APV régimen B.',
+            'note' => 'Nota crítica de seguimiento comercial que no debe perderse.',
         ]);
 
-        FollowUp::create([
-            'lead_id' => $lead->id,
-            'assigned_user_id' => $advisor->id,
-            'due_at' => now()->addDays(2),
-            'note' => 'Reunión Zoom agendada.',
-        ]);
+        // 3. La planilla de Google Sheets cambia datos de contacto y estado de notificación
+        $datasetUpdated = [
+            'Hoja 2' => [
+                ['id', 'full_name', 'email', 'phone', 'campaign_name', 'lead_status'],
+                ['meta-update-1', 'Nombre Corregido', 'nuevo@test.cl', '+56999999999', 'Camp APV 2026', 'notificado'],
+            ],
+        ];
+        $service->syncDataset($datasetUpdated);
 
-        // 3. Ejecutar sincronización posterior desde Sheets
-        $service->syncDataset($dataset);
-
-        // 4. Verificar que el estado, notas y seguimientos comerciales NO fueron sobrescritos
+        // 4. Verificación de actualización de datos de origen
         $lead->refresh();
-        $this->assertEquals(LeadManagement::STATUS_REUNION_AGENDADA, $lead->management->status);
+        $this->assertEquals('Nombre Corregido', $lead->name);
+        $this->assertEquals('nuevo@test.cl', $lead->email);
+        $this->assertEquals('+56999999999', $lead->phone);
+        $this->assertEquals('Camp APV 2026', $lead->campaign);
+        $this->assertEquals('notificado', $lead->notification_status);
+
+        // 5. Verificación de PRESERVACIÓN ESTRICTA de la gestión comercial
+        $this->assertEquals(LeadManagement::STATUS_EN_SEGUIMIENTO, $lead->management->status);
         $this->assertEquals($advisor->id, $lead->management->assigned_user_id);
         $this->assertCount(1, $lead->activities);
-        $this->assertEquals('Cliente muy interesado en APV régimen B.', $lead->activities->first()->note);
-        $this->assertCount(1, $lead->followUps);
+        $this->assertEquals('Nota crítica de seguimiento comercial que no debe perderse.', $lead->activities->first()->note);
     }
 
     public function test_persists_notes_status_changes_and_follow_ups(): void
@@ -160,13 +205,11 @@ class SyncAndPersistenceTest extends TestCase
     {
         $service = new GoogleSheetsReaderService();
 
-        // Verificar la constante de alcance estricto
         $this->assertEquals(
             'https://www.googleapis.com/auth/spreadsheets.readonly',
             GoogleSheetsReaderService::READONLY_SCOPE
         );
 
-        // Falsificar llamadas HTTP a Google Sheets API
         Http::fake([
             'https://sheets.googleapis.com/v4/spreadsheets/*' => Http::response([
                 'values' => [
@@ -179,7 +222,6 @@ class SyncAndPersistenceTest extends TestCase
         $rows = $service->fetchSheetValues('dummy-token', 'dummy-spreadsheet-id', 'Hoja 2');
         $this->assertCount(2, $rows);
 
-        // Verificar que solo se ejecutó petición GET y ninguna llamada destructiva (POST, PUT, DELETE, PATCH)
         Http::assertSent(function ($request) {
             return $request->method() === 'GET'
                 && str_contains($request->url(), 'https://sheets.googleapis.com');

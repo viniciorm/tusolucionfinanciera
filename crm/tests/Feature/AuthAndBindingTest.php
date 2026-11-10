@@ -9,7 +9,6 @@ use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Http;
 use RuntimeException;
 use Tests\TestCase;
-use TSF\Security\GoogleAccountBinding;
 
 class AuthAndBindingTest extends TestCase
 {
@@ -46,7 +45,6 @@ class AuthAndBindingTest extends TestCase
     {
         session(['oauth_google_state' => 'valid-state-12345']);
 
-        // State ausente o diferente
         $response = $this->get('/auth/google/callback?state=invalid-state&code=test-code');
         $response->assertRedirect('/login');
         $response->assertSessionHasErrors('error');
@@ -58,7 +56,7 @@ class AuthAndBindingTest extends TestCase
 
     public function test_rejects_unverified_email_from_google(): void
     {
-        $user = User::create([
+        User::create([
             'email' => 'asesor@ejemplo.test',
             'name' => 'Asesor Activo',
             'role' => 'advisor',
@@ -113,7 +111,7 @@ class AuthAndBindingTest extends TestCase
 
     public function test_rejects_mismatched_google_subject_on_already_bound_account(): void
     {
-        $user = User::create([
+        User::create([
             'email' => 'asesor@ejemplo.test',
             'name' => 'Asesor Vinculado',
             'role' => 'advisor',
@@ -179,5 +177,111 @@ class AuthAndBindingTest extends TestCase
             googleEmail: 'usuario2@ejemplo.test',
             googleEmailVerified: true
         );
+    }
+
+    public function test_concurrent_binding_race_condition_protection_after_acquiring_row_lock(): void
+    {
+        $user = User::create([
+            'email' => 'concurrente@ejemplo.test',
+            'name' => 'Usuario Concurrente',
+            'role' => 'admin',
+            'active' => true,
+            'google_subject' => null,
+        ]);
+
+        $firstRead = true;
+        User::retrieved(function ($model) use (&$firstRead) {
+            if ($firstRead && $model->email === 'concurrente@ejemplo.test') {
+                $firstRead = false;
+                \Illuminate\Support\Facades\DB::table('users')
+                    ->where('id', $model->id)
+                    ->update(['google_subject' => 'google-sub-hilo-1']);
+            }
+        });
+
+        $service = new GoogleAuthService();
+
+        // El hilo concurrente llega intentando vincular 'google-sub-hilo-2'
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('Conflicto de concurrencia');
+
+        $service->authenticateVerifiedIdentity(
+            googleSubject: 'google-sub-hilo-2',
+            googleEmail: 'concurrente@ejemplo.test',
+            googleEmailVerified: true
+        );
+    }
+
+    public function test_concurrent_binding_rejects_if_account_deactivated_before_lock(): void
+    {
+        $user = User::create([
+            'email' => 'desactivado@ejemplo.test',
+            'name' => 'Usuario Desactivado',
+            'role' => 'advisor',
+            'active' => true,
+            'google_subject' => null,
+        ]);
+
+        $firstRead = true;
+        User::retrieved(function ($model) use (&$firstRead) {
+            if ($firstRead && $model->email === 'desactivado@ejemplo.test') {
+                $firstRead = false;
+                \Illuminate\Support\Facades\DB::table('users')
+                    ->where('id', $model->id)
+                    ->update(['active' => false]);
+            }
+        });
+
+        $service = new GoogleAuthService();
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('desactivada');
+
+        $service->authenticateVerifiedIdentity(
+            googleSubject: 'google-sub-nuevo',
+            googleEmail: 'desactivado@ejemplo.test',
+            googleEmailVerified: true
+        );
+    }
+
+    public function test_google_id_token_verification_validates_claims_and_expiration(): void
+    {
+        $service = new GoogleAuthService();
+        $expectedAudience = 'my-client-id.apps.googleusercontent.com';
+
+        Http::fake([
+            'https://oauth2.googleapis.com/tokeninfo*' => Http::response([
+                'iss' => 'https://accounts.google.com',
+                'aud' => $expectedAudience,
+                'sub' => 'google-sub-tokeninfo-123',
+                'email' => 'valido@ejemplo.test',
+                'email_verified' => 'true',
+                'name' => 'Nombre Verificado',
+                'exp' => time() + 3600,
+            ], 200),
+        ]);
+
+        $claims = $service->verifyGoogleIdToken('mock-id-token-xyz', $expectedAudience);
+
+        $this->assertEquals('google-sub-tokeninfo-123', $claims['sub']);
+        $this->assertEquals('valido@ejemplo.test', $claims['email']);
+        $this->assertTrue($claims['email_verified']);
+    }
+
+    public function test_google_id_token_verification_rejects_invalid_token(): void
+    {
+        $service = new GoogleAuthService();
+
+        Http::fake([
+            'https://oauth2.googleapis.com/tokeninfo*' => Http::response([
+                'error' => 'invalid_token',
+                'error_description' => 'Invalid Value',
+            ], 400),
+        ]);
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('no es válido');
+
+        $service->verifyGoogleIdToken('invalid-token', 'my-client-id');
     }
 }

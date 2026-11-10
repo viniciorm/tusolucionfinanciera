@@ -100,10 +100,25 @@ return new class extends Migration {
             $t->longText('payload');
             $t->integer('last_activity')->index();
         });
+
+        // Tablas de caché y bloqueos atómicos para comandos artisan
+        Schema::create('cache', function (Blueprint $t): void {
+            $t->string('key')->primary();
+            $t->mediumText('value');
+            $t->integer('expiration');
+        });
+
+        Schema::create('cache_locks', function (Blueprint $t): void {
+            $t->string('key')->primary();
+            $t->string('owner');
+            $t->integer('expiration');
+        });
     }
 
     public function down(): void
     {
+        Schema::dropIfExists('cache_locks');
+        Schema::dropIfExists('cache');
         Schema::dropIfExists('sessions');
         Schema::dropIfExists('sync_runs');
         Schema::dropIfExists('audit_events');

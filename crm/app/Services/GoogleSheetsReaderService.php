@@ -22,13 +22,14 @@ class GoogleSheetsReaderService
     public const READONLY_SCOPE = 'https://www.googleapis.com/auth/spreadsheets.readonly';
 
     public function __construct(
-        private readonly SheetLeadNormalizer $normalizer = new SheetLeadNormalizer(),
+        private readonly ?SheetLeadNormalizer $normalizer = null,
         private readonly ?SheetBatchValidator $batchValidator = null,
     ) {}
 
     public function getValidator(): SheetBatchValidator
     {
-        return $this->batchValidator ?? new SheetBatchValidator($this->normalizer);
+        $normalizer = $this->normalizer ?? new SheetLeadNormalizer();
+        return $this->batchValidator ?? new SheetBatchValidator($normalizer);
     }
 
     /**
@@ -58,8 +59,7 @@ class GoogleSheetsReaderService
         ];
 
         $encode = static fn ($data) => rtrim(strtr(base64_encode(json_encode($data, JSON_THROW_ON_ERROR)), '+/', '-_'), '=');
-        $segments = [$encode($header), $encode($claims)];
-        $signingInput = implode('.', $segments);
+        $signingInput = implode('.', [$encode($header), $encode($claims)]);
 
         $privateKey = openssl_pkey_get_private($credentials['private_key']);
         if (!$privateKey) {
@@ -109,7 +109,6 @@ class GoogleSheetsReaderService
 
     /**
      * Ejecuta una sincronización completa e idempotente a partir de matrices de datos.
-     * Puede recibir un proveedor de datos para pruebas o consultar la API real.
      */
     public function syncDataset(array $sheetsData): SyncRun
     {
@@ -160,7 +159,11 @@ class GoogleSheetsReaderService
                     $lead = Lead::where('source_key', $sourceKey)->first();
 
                     if (!$lead) {
-                        // Nuevo prospecto
+                        // 1. Prospecto nuevo: resolver asignación verificable o marcar pendiente de conciliación
+                        $resolvedAdvisor = AdvisorAssignmentResolver::resolve($leadData['source_assigned_to']);
+                        $initialAssignedUserId = $resolvedAdvisor ? $resolvedAdvisor->id : null;
+                        $reconciliationPending = ($initialAssignedUserId === null);
+
                         $lead = Lead::create([
                             'source_key' => $sourceKey,
                             'source_sheet' => $leadData['source_sheet'],
@@ -174,28 +177,54 @@ class GoogleSheetsReaderService
                             'campaign' => $leadData['campaign'] ?: null,
                             'form' => $leadData['form'] ?: null,
                             'notification_status' => $leadData['notification_status'] ?: null,
-                            'source_assigned_to' => $leadData['source_assigned_to'] ?: null,
-                            'reconciliation_pending' => true,
+                            'source_assigned_to' => $leadData['source_assigned_to'] ?: null, // Dato original sin alterar
+                            'reconciliation_pending' => $reconciliationPending,
                             'original' => $leadData['original'],
                             'last_seen_at' => now(),
                         ]);
 
-                        // Crear gestión comercial con estado inicial 'Nuevo'
+                        // Crear gestión comercial con estado inicial 'Nuevo' y asignación interna verificada
                         LeadManagement::create([
                             'lead_id' => $lead->id,
                             'status' => LeadManagement::STATUS_NUEVO,
-                            'assigned_user_id' => null,
+                            'assigned_user_id' => $initialAssignedUserId,
                         ]);
 
                         $sheetSaved++;
                     } else {
-                        // Prospecto existente: actualizar únicamente last_seen_at y original si cambió
-                        // REGLA CRÍTICA: NUNCA sobrescribir estados comerciales, asignaciones internas ni notas de gestión
-                        $lead->last_seen_at = now();
-                        if ($leadData['notification_status'] && $lead->notification_status !== $leadData['notification_status']) {
-                            $lead->notification_status = $leadData['notification_status'];
+                        // 2. Prospecto existente: ACTUALIZAR CAMPOS DE ORIGEN QUE HAYAN CAMBIADO
+                        if ($lead->name !== ($leadData['name'] ?: null)) {
+                            $lead->name = $leadData['name'] ?: null;
                         }
+                        if ($lead->email !== ($leadData['email'] ?: null)) {
+                            $lead->email = $leadData['email'] ?: null;
+                        }
+                        if ($lead->phone !== ($leadData['phone'] ?: null)) {
+                            $lead->phone = $leadData['phone'] ?: null;
+                            $lead->phone_search = $leadData['phone_search'] ?: null;
+                        }
+                        if ($lead->campaign !== ($leadData['campaign'] ?: null)) {
+                            $lead->campaign = $leadData['campaign'] ?: null;
+                        }
+                        if ($lead->form !== ($leadData['form'] ?: null)) {
+                            $lead->form = $leadData['form'] ?: null;
+                        }
+                        if ($lead->notification_status !== ($leadData['notification_status'] ?: null)) {
+                            $lead->notification_status = $leadData['notification_status'] ?: null;
+                        }
+                        if ($lead->source_assigned_to !== ($leadData['source_assigned_to'] ?: null)) {
+                            $lead->source_assigned_to = $leadData['source_assigned_to'] ?: null;
+                        }
+                        if ($lead->original !== $leadData['original']) {
+                            $lead->original = $leadData['original'];
+                        }
+
+                        $lead->last_seen_at = now();
                         $lead->save();
+
+                        // REGLA CRÍTICA ESTRICTA:
+                        // NUNCA sobrescribir lead_management.status, lead_management.assigned_user_id,
+                        // ni actividades o notas creadas en el CRM.
                         $sheetSaved++;
                     }
                 }
