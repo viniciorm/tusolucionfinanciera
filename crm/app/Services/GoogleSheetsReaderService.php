@@ -7,6 +7,8 @@ use App\Models\Lead;
 use App\Models\LeadManagement;
 use App\Models\SyncRun;
 use Carbon\Carbon;
+use Illuminate\Contracts\Cache\Lock;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use InvalidArgumentException;
@@ -22,6 +24,17 @@ class GoogleSheetsReaderService
     public const READONLY_SCOPE = 'https://www.googleapis.com/auth/spreadsheets.readonly';
     public const SYNC_LOCK_KEY = 'crm_sheets_sync_shared_lock';
     public const SYNC_LOCK_TTL = 600; // 10 minutos de protección máxima
+
+    /**
+     * Obtiene el bloqueo atómico compartido entre procesos independientes (Web HTTP y Cron CLI)
+     * utilizando el controlador de base de datos (`cache_locks`), garantizando exclusión mutua
+     * y soporte nativo de `DatabaseLock::refresh()`.
+     */
+    public static function getSharedLock(): Lock
+    {
+        $store = config('cache.locks_store', 'database');
+        return Cache::store($store)->lock(self::SYNC_LOCK_KEY, self::SYNC_LOCK_TTL);
+    }
 
     public function __construct(
         private readonly ?SheetLeadNormalizer $normalizer = null,
@@ -160,7 +173,12 @@ class GoogleSheetsReaderService
                 $sheetSaved = 0;
                 $sheetRejected = count($rejectedRows);
 
-                foreach ($validLeads as $leadData) {
+                foreach ($validLeads as $leadIndex => $leadData) {
+                    // Heartbeat periódico durante el procesamiento de filas de una sola hoja
+                    if ($heartbeat !== null && ($leadIndex % 25 === 0)) {
+                        $heartbeat();
+                    }
+
                     $sourceKey = $leadData['source_key'];
 
                     $lead = Lead::where('source_key', $sourceKey)->first();

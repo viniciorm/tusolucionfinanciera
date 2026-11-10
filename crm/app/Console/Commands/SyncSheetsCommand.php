@@ -8,6 +8,7 @@ use App\Services\GoogleSheetsReaderService;
 use Illuminate\Console\Command;
 use Illuminate\Contracts\Console\Isolatable;
 use Illuminate\Support\Facades\Cache;
+use RuntimeException;
 use Throwable;
 
 class SyncSheetsCommand extends Command implements Isolatable
@@ -21,10 +22,8 @@ class SyncSheetsCommand extends Command implements Isolatable
         $this->info('[' . date('Y-m-d H:i:s') . '] Iniciando verificación de sincronización programada...');
 
         // 1. Protección contra ejecuciones superpuestas compartida con sincronización manual
-        $lockKey = GoogleSheetsReaderService::SYNC_LOCK_KEY;
-        $lockDurationSeconds = GoogleSheetsReaderService::SYNC_LOCK_TTL;
-
-        $lock = Cache::lock($lockKey, $lockDurationSeconds);
+        // Se utiliza explícitamente el controlador de base de datos (`cache_locks`) para aislar procesos independientes
+        $lock = GoogleSheetsReaderService::getSharedLock();
 
         if ($this->option('force')) {
             $this->warn('Opción --force detectada: liberando forzosamente cualquier bloqueo previo residual...');
@@ -102,16 +101,29 @@ class SyncSheetsCommand extends Command implements Isolatable
     }
 
     /**
-     * Extiende el TTL del bloqueo para evitar expiración en sincronizaciones prolongadas (> 600s).
+     * Renueva el bloqueo atómico y verifica que la propiedad continúe perteneciendo a este proceso.
+     * Si la renovación falla (bloqueo expirado o tomado por otro proceso), aborta inmediatamente.
+     *
+     * @throws RuntimeException si se perdió la propiedad del bloqueo
      */
     protected function refreshLockHeartbeat($lock): void
     {
-        try {
-            if (method_exists($lock, 'refresh')) {
-                $lock->refresh(GoogleSheetsReaderService::SYNC_LOCK_TTL);
+        if (method_exists($lock, 'refresh')) {
+            $refreshed = $lock->refresh(GoogleSheetsReaderService::SYNC_LOCK_TTL);
+            if (!$refreshed) {
+                AuditEvent::log('sync.lock_lost', null, null, [
+                    'reason' => 'Falló la renovación del bloqueo en DatabaseLock. El bloqueo expiró o fue adquirido por otro proceso.',
+                ]);
+                throw new RuntimeException('Se perdió la propiedad del bloqueo de sincronización durante la ejecución. Operación abortada para evitar colisiones.');
             }
-        } catch (Throwable) {
-            // No interrumpir si el driver de prueba no implementa refresh
+            return;
+        }
+
+        if (method_exists($lock, 'isOwnedByCurrentProcess') && !$lock->isOwnedByCurrentProcess()) {
+            AuditEvent::log('sync.lock_lost', null, null, [
+                'reason' => 'El proceso actual ya no es propietario del bloqueo.',
+            ]);
+            throw new RuntimeException('Se perdió la propiedad del bloqueo de sincronización durante la ejecución. Operación abortada.');
         }
     }
 }

@@ -99,7 +99,7 @@ class AdminController extends Controller
             return back()->withErrors(['error' => 'La cuenta de servicio o el ID de la planilla no están configurados en el archivo privado .env']);
         }
 
-        $lock = Cache::lock(GoogleSheetsReaderService::SYNC_LOCK_KEY, GoogleSheetsReaderService::SYNC_LOCK_TTL);
+        $lock = GoogleSheetsReaderService::getSharedLock();
 
         if (!$lock->get()) {
             AuditEvent::log('sync.manual_skipped_overlap', Auth::id(), null, [
@@ -113,16 +113,12 @@ class AdminController extends Controller
 
             $sheetsData = [];
             foreach (GoogleSheetsReaderService::ALLOWED_SHEETS as $sheetName) {
-                if (method_exists($lock, 'refresh')) {
-                    try { $lock->refresh(GoogleSheetsReaderService::SYNC_LOCK_TTL); } catch (Throwable) {}
-                }
+                $this->assertAndRefreshLock($lock);
                 $sheetsData[$sheetName] = $this->sheetsService->fetchSheetValues($token, $spreadsheetId, $sheetName);
             }
 
             $syncRun = $this->sheetsService->syncDataset($sheetsData, function () use ($lock): void {
-                if (method_exists($lock, 'refresh')) {
-                    try { $lock->refresh(GoogleSheetsReaderService::SYNC_LOCK_TTL); } catch (Throwable) {}
-                }
+                $this->assertAndRefreshLock($lock);
             });
 
             AuditEvent::log('sync.manual_completed', Auth::id(), null, [
@@ -140,6 +136,33 @@ class AdminController extends Controller
             return back()->withErrors(['error' => 'Error durante la sincronización: ' . $e->getMessage()]);
         } finally {
             $lock->release();
+        }
+    }
+
+    /**
+     * Renueva el bloqueo atómico y verifica que la propiedad continúe perteneciendo a este proceso.
+     * Si la renovación falla, aborta inmediatamente.
+     *
+     * @throws RuntimeException si se perdió la propiedad del bloqueo
+     */
+    protected function assertAndRefreshLock($lock): void
+    {
+        if (method_exists($lock, 'refresh')) {
+            $refreshed = $lock->refresh(GoogleSheetsReaderService::SYNC_LOCK_TTL);
+            if (!$refreshed) {
+                AuditEvent::log('sync.lock_lost', Auth::id(), null, [
+                    'reason' => 'Falló la renovación del bloqueo en DatabaseLock. El bloqueo expiró o fue adquirido por otro proceso.',
+                ]);
+                throw new \RuntimeException('Se perdió la propiedad del bloqueo de sincronización durante la ejecución. Operación abortada para evitar colisiones.');
+            }
+            return;
+        }
+
+        if (method_exists($lock, 'isOwnedByCurrentProcess') && !$lock->isOwnedByCurrentProcess()) {
+            AuditEvent::log('sync.lock_lost', Auth::id(), null, [
+                'reason' => 'El proceso actual ya no es propietario del bloqueo.',
+            ]);
+            throw new \RuntimeException('Se perdió la propiedad del bloqueo de sincronización durante la ejecución. Operación abortada.');
         }
     }
 
