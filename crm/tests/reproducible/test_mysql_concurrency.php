@@ -9,16 +9,23 @@
  *    ejecutarse sobre bases principales.
  * 2. Ejecuta las migraciones reales del CRM (`php artisan migrate`) en la base de pruebas,
  *    utilizando el esquema oficial (incluyendo `audit_events` con `lead_id` y `details`).
- * 3. Sincroniza ambos procesos demostrando mediante señal de conexión y consulta a
- *    `information_schema.innodb_trx` que el Proceso B está intentando adquirir el cerrojo
- *    y esperando en `LOCK WAIT` ANTES del commit de A.
- * 4. Mide el tiempo de ejecución del servicio real sin atribuirlo falsamente de forma exclusiva
+ * 3. Crea un usuario ficticio real en `users` para garantizar la integridad referencial
+ *    y la clave foránea (`lead_management.assigned_user_id -> users.id`), limpiando
+ *    todos los registros creados al finalizar en `finally`.
+ * 4. Identifica la conexión real del Proceso B mediante `SELECT CONNECTION_ID() AS id`.
+ *    Sincroniza ambos procesos demostrando que la conexión de B está físicamente esperando
+ *    el cerrojo (`LOCK WAIT` en `information_schema.innodb_trx` o `SHOW PROCESSLIST`)
+ *    ANTES del commit de A.
+ * 5. Si no es posible demostrar de forma concluyente que la conexión de B está esperando,
+ *    informa `[RESULTADO NO CONCLUYENTE - NO APROBADO]`, nunca lo presenta como aprobado.
+ * 6. Mide el tiempo de ejecución del servicio real sin atribuirlo falsamente de forma exclusiva
  *    a bloqueo, reconociendo que comprende el intervalo en LOCK WAIT más el procesamiento
  *    posterior de reconciliación y auditoría.
- * 5. Si el servicio real de Laravel no está disponible, reporta que la prueba no se ejecutó;
- *    NUNCA se presenta como aprobada mediante un fallback PDO.
- * 6. Activa la protección de ejecución única antes de iniciar la prueba (incluso si falla)
- *    para impedir ejecuciones repetidas cada minuto en Cron.
+ * 7. Si el servicio real de Laravel no está disponible, reporta que la prueba no se ejecutó;
+ *    NUNCA se presenta como aprobada mediante un fallback simulado.
+ * 8. Mecanismo único de ejecución para Cron: el propio script gestiona el archivo testigo
+ *    inmediatamente antes de iniciar la prueba, impidiendo recurrencias incluso si falla,
+ *    sin que wrappers externos creen el archivo antes de tiempo.
  *
  * Configuración comprobada en hosting:
  * - Base de datos de prueba: tusoluc1_crm_test
@@ -26,7 +33,7 @@
  * - PHP CLI comprobado: /usr/local/bin/php
  */
 
-// 1. Detección y activación inmediata de protección contra repetición en Cron
+// 1. Detección y activación del cerrojo unificado contra repetición en Cron
 $options = getopt('', ['worker', 'lead::', 'mgmt::', 'env-file::', 'force']);
 $isWorker = isset($options['worker']);
 
@@ -153,9 +160,13 @@ if ($isWorker) {
         \Illuminate\Support\Facades\DB::purge('mysql_concurrency_test');
         \Illuminate\Support\Facades\DB::setDefaultConnection('mysql_concurrency_test');
 
-        // 2. SINCRONIZACIÓN: Laravel arrancó y la conexión está lista.
-        // Notificar al Proceso A que Proceso B está por invocar el servicio de reconciliación
-        echo "SERVICE_READY_FOR_LOCK\n";
+        // Obtener el ID exacto de conexión / hilo en MySQL
+        $connectionRow = \Illuminate\Support\Facades\DB::selectOne("SELECT CONNECTION_ID() AS id");
+        $connectionId = $connectionRow ? (int)$connectionRow->id : 0;
+
+        // 2. SINCRONIZACIÓN: Laravel arrancó, la conexión está lista e identificada por su ID de hilo.
+        // Notificar al Proceso A con el connection_id para verificación en innodb_trx o processlist
+        echo "SERVICE_READY_FOR_LOCK:conn_id={$connectionId}\n";
         if (ob_get_level() > 0) {
             ob_flush();
         }
@@ -182,6 +193,7 @@ if ($isWorker) {
 
         echo json_encode([
             'success' => true,
+            'connection_id' => $connectionId,
             'service_executed' => 'AdvisorAssignmentResolver::reconcilePendingLeads',
             'service_elapsed_seconds' => round($elapsedService, 4),
             'resolver_result' => $resolverResult,
@@ -241,13 +253,6 @@ if (!str_contains(strtolower($database), 'test')) {
     exit(1);
 }
 
-echo "Destino: {$host}:{$port}\n";
-echo "Base de datos de prueba: {$database} [AISLADA / TEST]\n";
-echo "Usuario de prueba: " . ($username ?: '(no definido)') . "\n";
-echo "PHP CLI comprobado: " . PHP_BINARY . "\n";
-echo "Credenciales: [PROTEGIDAS / CARGADAS DESDE ARCHIVO SEGURO]\n";
-echo "Protección anti-repetición en Cron: [ACTIVADA PREVENTIVAMENTE]\n\n";
-
 if (empty($username)) {
     echo "----------------------------------------------------------------------\n";
     echo "[PRUEBA PENDIENTE / OMITIDA - NO APROBADA]\n";
@@ -256,10 +261,19 @@ if (empty($username)) {
     exit(0);
 }
 
-// Activar el cerrojo de ejecución única ANTES de iniciar la prueba (incluso si falla durante el proceso)
+// MECANISMO ÚNICO DE EJECUCIÓN:
+// Activar el cerrojo de ejecución única inmediatamente en el propio script PHP
+// antes de iniciar la prueba (incluso si falla o se interrumpe durante el proceso)
 if (!$isWorker && $flagFile) {
     @file_put_contents($flagFile, date('Y-m-d H:i:s T') . " - Ejecución iniciada sobre '{$database}' (cerrojo activo)");
 }
+
+echo "Destino: {$host}:{$port}\n";
+echo "Base de datos de prueba: {$database} [AISLADA / TEST]\n";
+echo "Usuario de prueba: {$username}\n";
+echo "PHP CLI comprobado: " . PHP_BINARY . "\n";
+echo "Credenciales: [PROTEGIDAS / CARGADAS DESDE ARCHIVO SEGURO]\n";
+echo "Protección anti-repetición en Cron: [ACTIVADA PREVENTIVAMENTE POR SCRIPT]\n\n";
 
 try {
     $dsn = "mysql:host={$host};port={$port};dbname={$database};charset=utf8mb4";
@@ -278,7 +292,7 @@ try {
 }
 
 // 3. Ejecutar las migraciones REALES del CRM en la base de pruebas vacía
-echo "[1/6] Ejecutando migraciones reales del CRM sobre base de pruebas '{$database}'...\n";
+echo "[1/7] Ejecutando migraciones reales del CRM sobre base de pruebas '{$database}'...\n";
 if (!file_exists($autoloadPath) || !file_exists($bootstrapPath)) {
     echo "----------------------------------------------------------------------\n";
     echo "[PRUEBA NO EJECUTADA - ENTORNO INCOMPLETO]\n";
@@ -315,11 +329,19 @@ config([
 \Illuminate\Support\Facades\Artisan::call('migrate', ['--force' => true]);
 echo "      -> Migraciones oficiales aplicadas (esquema verificado: audit_events usa lead_id y details).\n";
 
-// 4. Preparar registro de prueba con reconciliation_pending = 1 y assigned_user_id = NULL
+// 4. Crear usuario ficticio para respetar la clave foránea (assigned_user_id -> users.id)
+$testUserEmail = 'test_advisor_race_' . bin2hex(random_bytes(4)) . '@test.local';
+echo "[2/7] Creando usuario asesor ficticio para respetar clave foránea ('{$testUserEmail}')...\n";
+$stmtUser = $pdoA->prepare("INSERT INTO users (name, email, role, active, created_at, updated_at) VALUES ('Asesor Test Concurrencia', :email, 'advisor', 1, NOW(), NOW())");
+$stmtUser->execute(['email' => $testUserEmail]);
+$testUserId = (int) $pdoA->lastInsertId();
+echo "      -> Usuario ficticio creado exitosamente con ID real #{$testUserId}.\n";
+
+// 5. Preparar registro de prueba con reconciliation_pending = 1 y assigned_user_id = NULL
 $metaId = 'crm-sync-race-' . bin2hex(random_bytes(6));
 $sourceKey = sha1('Hoja3_' . $metaId);
 
-echo "[2/6] Creando lead de prueba en base aislada (meta_id: {$metaId})...\n";
+echo "[3/7] Creando lead de prueba en base aislada (meta_id: {$metaId})...\n";
 $stmtLead = $pdoA->prepare("INSERT INTO leads (source_key, source_sheet, meta_id, name, email, source_assigned_to, reconciliation_pending, original, created_at, updated_at) VALUES (:key, 'Hoja 3', :meta, 'Lead Concurrente Test', 'test@concurrente.cl', 'Pao', 1, '{}', NOW(), NOW())");
 $stmtLead->execute(['key' => $sourceKey, 'meta' => $metaId]);
 $leadId = (int) $pdoA->lastInsertId();
@@ -329,17 +351,17 @@ $stmtMgmt->execute(['lead_id' => $leadId]);
 $mgmtId = (int) $pdoA->lastInsertId();
 
 try {
-    // 5. Proceso A inicia transacción y adquiere bloqueo pesimista FOR UPDATE
-    echo "[3/6] Proceso A inicia transacción y adquiere SELECT ... FOR UPDATE sobre fila #{$mgmtId}...\n";
+    // 6. Proceso A inicia transacción y adquiere bloqueo pesimista FOR UPDATE
+    echo "[4/7] Proceso A inicia transacción y adquiere SELECT ... FOR UPDATE sobre fila #{$mgmtId}...\n";
     $pdoA->beginTransaction();
     $stmtLock = $pdoA->prepare("SELECT id, assigned_user_id FROM lead_management WHERE id = :id FOR UPDATE");
     $stmtLock->execute(['id' => $mgmtId]);
     $lockedRow = $stmtLock->fetch();
     echo "      -> Bloqueo exclusivo de fila retenido exitosamente por Proceso A.\n";
 
-    // 6. Lanzar Proceso B como subproceso independiente
+    // 7. Lanzar Proceso B como subproceso independiente
     // Las credenciales se transmiten mediante variables de entorno seguras de proc_open, NUNCA en argv
-    echo "[4/6] Iniciando Proceso B concurrente (inicializando Laravel y servicio real)...\n";
+    echo "[5/7] Iniciando Proceso B concurrente (inicializando Laravel y servicio real)...\n";
     $descriptors = [
         0 => ['pipe', 'r'],
         1 => ['pipe', 'w'],
@@ -364,73 +386,99 @@ try {
     }
 
     // SINCRONIZACIÓN EXACTA:
-    // Esperar señal de que Proceso B ya inicializó Laravel y está por invocar el servicio de reconciliación
-    $signal = trim(fgets($pipes[1]));
-    if ($signal !== 'SERVICE_READY_FOR_LOCK') {
+    // Esperar señal de que Proceso B ya inicializó Laravel y transmitió su connection_id
+    $signalLine = trim(fgets($pipes[1]));
+    $workerConnId = 0;
+    if (preg_match('/^SERVICE_READY_FOR_LOCK:conn_id=(\d+)$/', $signalLine, $matches)) {
+        $workerConnId = (int)$matches[1];
+    } elseif ($signalLine !== 'SERVICE_READY_FOR_LOCK') {
         $err = stream_get_contents($pipes[2]);
         $rawOut = stream_get_contents($pipes[1]);
         proc_close($proc);
         echo "----------------------------------------------------------------------\n";
         echo "[PRUEBA NO EJECUTADA - SERVICIO NO DISPONIBLE]\n";
         echo "El Proceso B no pudo inicializar el servicio real de Laravel.\n";
-        echo "Detalle: " . ($signal ?: $err ?: $rawOut) . "\n";
+        echo "Detalle: " . ($signalLine ?: $err ?: $rawOut) . "\n";
         echo "Por directriz de seguridad, no se aprueba mediante fallback simulado.\n";
         echo "----------------------------------------------------------------------\n";
         exit(1);
     }
-    echo "      -> Proceso B arrancó Laravel y conectó a la base aislada.\n";
+    echo "      -> Proceso B arrancó Laravel y conectó a la base aislada (MySQL Connection ID: #{$workerConnId}).\n";
     echo "      -> Proceso B invocó AdvisorAssignmentResolver::reconcilePendingLeads().\n";
 
-    // Comprobación activa de que Proceso B está en LOCK WAIT antes de que Proceso A haga commit
+    // Comprobación demostrable e inequívoca de espera en InnoDB para la conexión de B
     $detectedWait = false;
-    $waitDetails = '';
-    for ($attempt = 0; $attempt < 20; $attempt++) {
-        usleep(100000); // 100ms
-        try {
-            $trxStmt = $pdoA->query("SELECT trx_id, trx_state FROM information_schema.innodb_trx WHERE trx_state = 'LOCK WAIT'");
-            $waitingRows = $trxStmt->fetchAll(PDO::FETCH_ASSOC);
-            if (!empty($waitingRows)) {
-                $detectedWait = true;
-                $waitDetails = 'information_schema.innodb_trx (trx_state = LOCK WAIT)';
-                break;
-            }
-        } catch (\Throwable) {
-            // Intentar SHOW PROCESSLIST como alternativa
+    $waitEvidence = '';
+
+    for ($attempt = 0; $attempt < 25; $attempt++) {
+        usleep(80000); // 80ms
+
+        // 1. Verificar específicamente por trx_mysql_thread_id en information_schema.innodb_trx
+        if ($workerConnId > 0) {
             try {
-                $procList = $pdoA->query("SHOW PROCESSLIST")->fetchAll(PDO::FETCH_ASSOC);
-                foreach ($procList as $p) {
-                    $st = (string)($p['State'] ?? '');
-                    if (stripos($st, 'lock') !== false || stripos($st, 'updating') !== false) {
-                        $detectedWait = true;
-                        $waitDetails = "SHOW PROCESSLIST (State: {$st})";
-                        break 2;
-                    }
+                $trxStmt = $pdoA->prepare("SELECT trx_id, trx_state, trx_mysql_thread_id FROM information_schema.innodb_trx WHERE trx_mysql_thread_id = :conn_id AND trx_state = 'LOCK WAIT'");
+                $trxStmt->execute(['conn_id' => $workerConnId]);
+                $waitingRow = $trxStmt->fetch(PDO::FETCH_ASSOC);
+                if ($waitingRow) {
+                    $detectedWait = true;
+                    $waitEvidence = "innodb_trx (hilo #{$workerConnId} en estado LOCK WAIT)";
+                    break;
                 }
             } catch (\Throwable) {}
         }
+
+        // 2. Si innodb_trx no arroja filas o faltan privilegios, verificar en SHOW PROCESSLIST por el ID de conexión de B
+        try {
+            $procList = $pdoA->query("SHOW PROCESSLIST")->fetchAll(PDO::FETCH_ASSOC);
+            foreach ($procList as $p) {
+                $pId = (int)($p['Id'] ?? 0);
+                if ($workerConnId > 0 && $pId !== $workerConnId) {
+                    continue;
+                }
+                $st = (string)($p['State'] ?? '');
+                $info = (string)($p['Info'] ?? '');
+                if (stripos($st, 'lock') !== false || stripos($st, 'updating') !== false || stripos($info, 'FOR UPDATE') !== false) {
+                    $detectedWait = true;
+                    $waitEvidence = "SHOW PROCESSLIST (hilo #{$pId}, State: '{$st}')";
+                    break 2;
+                }
+            }
+        } catch (\Throwable) {}
     }
 
-    if ($detectedWait) {
-        echo "      -> Comprobación activa: Proceso B detectado en estado de espera activa ({$waitDetails}) ANTES del commit.\n";
-    } else {
-        echo "      -> Proceso B ejecutándose en segundo plano (señal SERVICE_READY_FOR_LOCK verificada previa a commit).\n";
+    if (!$detectedWait) {
+        // DIRECTRIZ ESTRICTA: Si no es posible demostrar la espera de B, informar resultado no concluyente, NO APROBADO
+        $pdoA->rollBack();
+        fclose($pipes[0]);
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+        proc_close($proc);
+
+        echo "----------------------------------------------------------------------\n";
+        echo "[RESULTADO NO CONCLUYENTE - NO APROBADO]\n";
+        echo "Motivo: No fue posible demostrar de forma inequívoca que la conexión #{$workerConnId}\n";
+        echo "del Proceso B estuvo efectivamente esperando el cerrojo en InnoDB antes del commit.\n";
+        echo "Verifique privilegios sobre information_schema o latencia de concurrencia.\n";
+        echo "----------------------------------------------------------------------\n";
+        exit(1);
     }
+
+    echo "      -> Comprobación activa inequívoca: {$waitEvidence} demostrada ANTES del commit.\n";
 
     // Proceso A retiene el bloqueo intencionalmente por 1.4 segundos
     $holdSeconds = 1.4;
-    echo "      -> Proceso A retiene el bloqueo de fila por {$holdSeconds}s...\n";
+    echo "      -> Proceso A retiene el bloqueo de fila por {$holdSeconds}s mientras B espera...\n";
     usleep((int)($holdSeconds * 1000000));
 
-    // 7. Proceso A realiza la asignación manual (usuario ID 99) y ejecuta COMMIT
-    echo "[5/6] Proceso A asigna manualmente asesor #99 y ejecuta COMMIT...\n";
-    $manualUserId = 99;
+    // 8. Proceso A realiza la asignación manual utilizando el ID real del usuario ficticio y ejecuta COMMIT
+    echo "[6/7] Proceso A asigna manualmente al asesor ficticio #{$testUserId} y ejecuta COMMIT...\n";
     $pdoA->prepare("UPDATE lead_management SET assigned_user_id = :user_id, updated_at = NOW() WHERE id = :id")
-        ->execute(['user_id' => $manualUserId, 'id' => $mgmtId]);
+        ->execute(['user_id' => $testUserId, 'id' => $mgmtId]);
     $pdoA->commit();
     echo "      -> COMMIT completado. Bloqueo de fila liberado en InnoDB.\n";
 
-    // 8. Proceso B se desbloquea y completa su ejecución
-    echo "[6/6] Esperando desbloqueo y finalización del servicio real en Proceso B...\n";
+    // 9. Proceso B se desbloquea y completa su ejecución
+    echo "[7/7] Esperando desbloqueo y finalización del servicio real en Proceso B...\n";
     $workerOut = stream_get_contents($pipes[1]);
     $workerErr = stream_get_contents($pipes[2]);
     fclose($pipes[0]);
@@ -464,31 +512,32 @@ try {
         exit(1);
     }
 
-    // Comprobación de auditoría en esquema real (lead_id y details)
+    // Comprobación de auditoría en esquema real (lead_id y details con testUserId real)
     if (empty($data['audit_logged'])) {
         echo "✗ ERROR: No se encontró el registro de auditoría 'leads.reconciliation_preserved_manual' con lead_id={$leadId}.\n";
         exit(1);
     }
-    if ((int)($data['audit_assigned_user_id'] ?? 0) !== 99) {
-        echo "✗ ERROR: El payload de auditoría no registró assigned_user_id = 99.\n";
+    if ((int)($data['audit_assigned_user_id'] ?? 0) !== $testUserId) {
+        echo "✗ ERROR: El payload de auditoría registró assigned_user_id = " . ($data['audit_assigned_user_id'] ?? 'null') . " (esperado #{$testUserId}).\n";
         exit(1);
     }
-    echo "      -> Auditoría oficial verificada: 'leads.reconciliation_preserved_manual' registrada con lead_id={$leadId} y details.assigned_user_id=99.\n";
+    echo "      -> Auditoría oficial verificada: 'leads.reconciliation_preserved_manual' registrada con lead_id={$leadId} y details.assigned_user_id={$testUserId}.\n";
 
     // Comprobación de estado final en base de datos
     $stmtFinal = $pdoA->prepare("SELECT lm.assigned_user_id, l.reconciliation_pending FROM lead_management lm JOIN leads l ON l.id = lm.lead_id WHERE lm.id = :id");
     $stmtFinal->execute(['id' => $mgmtId]);
     $final = $stmtFinal->fetch();
 
-    if ((int)$final['assigned_user_id'] === 99 && (int)$final['reconciliation_pending'] === 0) {
+    if ((int)$final['assigned_user_id'] === $testUserId && (int)$final['reconciliation_pending'] === 0) {
         echo "\n======================================================================\n";
         echo "✓ PRUEBA APROBADA EXITOSAMENTE:\n";
         echo "  1. Base de datos de prueba aislada y migraciones reales verificadas.\n";
-        echo "  2. Proceso B sincronizado: solicitó bloqueo y esperó ANTES del commit.\n";
-        echo "  3. Tiempo total de ejecución del servicio comprobado: {$serviceElapsed}s.\n";
-        echo "  4. Servicio real AdvisorAssignmentResolver ejecutado con éxito.\n";
-        echo "  5. Asignación manual preservada (ID 99) sin sobrescritura.\n";
-        echo "  6. Auditoría oficial con lead_id y details validada correctamente.\n";
+        echo "  2. Clave foránea respetada con usuario ficticio real (#{$testUserId}).\n";
+        echo "  3. Proceso B identificado (#{$workerConnId}) y demostrado en LOCK WAIT antes de commit.\n";
+        echo "  4. Tiempo total de ejecución del servicio comprobado: {$serviceElapsed}s.\n";
+        echo "  5. Servicio real AdvisorAssignmentResolver ejecutado con éxito.\n";
+        echo "  6. Asignación manual preservada (ID #{$testUserId}) sin sobrescritura.\n";
+        echo "  7. Auditoría oficial con lead_id y details validada correctamente.\n";
         echo "======================================================================\n";
     } else {
         echo "✗ ERROR: Inconsistencia final en base de datos.\n";
@@ -496,9 +545,15 @@ try {
     }
 } finally {
     try {
-        $pdoA->exec("DELETE FROM activities WHERE lead_id = {$leadId}");
-        $pdoA->exec("DELETE FROM audit_events WHERE lead_id = {$leadId}");
-        $pdoA->exec("DELETE FROM lead_management WHERE lead_id = {$leadId}");
-        $pdoA->exec("DELETE FROM leads WHERE id = {$leadId}");
+        if (!empty($leadId)) {
+            $pdoA->exec("DELETE FROM activities WHERE lead_id = {$leadId}");
+            $pdoA->exec("DELETE FROM audit_events WHERE lead_id = {$leadId}");
+            $pdoA->exec("DELETE FROM lead_management WHERE lead_id = {$leadId}");
+            $pdoA->exec("DELETE FROM leads WHERE id = {$leadId}");
+        }
+        if (!empty($testUserId)) {
+            $pdoA->exec("DELETE FROM users WHERE id = {$testUserId}");
+        }
     } catch (\Throwable) {}
 }
+
