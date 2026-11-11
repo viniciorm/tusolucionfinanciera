@@ -7,3 +7,10 @@
 *.pem
 *.key
 *service-account*.json
+
+*.sqlite
+*.sqlite-journal
+
+.phpunit.result.cache
+
+/bootstrap/cache/*.php

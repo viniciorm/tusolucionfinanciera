@@ -9,7 +9,7 @@ return new class extends Migration {
     {
         Schema::create('users', function (Blueprint $t) {
             $t->id(); $t->string('email', 191)->unique(); $t->string('name')->nullable();
-            $t->string('firebase_uid', 128)->nullable()->unique();
+            $t->string('google_subject', 128)->nullable()->unique();
             $t->string('role', 20)->default('advisor'); $t->boolean('active')->default(false); $t->timestamps();
         });
         Schema::create('leads', function (Blueprint $t) {
